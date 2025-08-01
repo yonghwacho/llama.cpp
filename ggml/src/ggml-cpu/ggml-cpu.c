@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
-
+/*DVfS*/
+#include "ggml-dvfs.h" 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
@@ -34,9 +35,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
-#if defined(__gnu_linux__)
-#include <syscall.h>
-#endif
+
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -145,6 +144,7 @@ static void atomic_thread_fence(memory_order mo) {
 typedef HANDLE pthread_t;
 
 typedef DWORD thread_ret_t;
+
 static int pthread_create(pthread_t * out, void * unused, thread_ret_t(*func)(void *), void * arg) {
     (void) unused;
     HANDLE handle = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE) func, arg, 0, NULL);
@@ -2843,6 +2843,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
+        if (state->ith == 0) {
+            ggml_dvfs_apply_if_needed(node->op);   // sysfs write 1 회 or no‑op
+        }
+        //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
+
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -2852,8 +2857,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+            /*
+            if (state->ith == 0) {
+                int cur_op = cgraph->nodes[node_n]->op;
+                //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
+                //printf("[debug] next_op=%d\n", next_op);
+            }
+            */
             ggml_barrier(state->threadpool);
         }
+        //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
     }
 
     ggml_barrier(state->threadpool);

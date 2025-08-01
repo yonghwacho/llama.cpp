@@ -204,6 +204,7 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+    add_subdirectory(tllm) 
 endif()
 
 #
