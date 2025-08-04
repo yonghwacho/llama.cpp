@@ -11,7 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-
+#include "arithmetic_intensity.h"
 //
 // llama_context
 //
@@ -731,6 +731,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+
+        /*arithmetic intensity compute*/
+        maybe_probe_ai(res->get_gf());
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
