@@ -67,42 +67,89 @@ static std::array<OpStats, GGML_OP_COUNT> op_stats = [](){
     return a;
 }();
 
+// void ggml_analyze_arithmetic_intensity(const ggml_cgraph * graph) {
+//     double total_flops = 0.0;
+//     double total_bytes = 0.0;
+
+//     for (int i = 0; i < graph->n_nodes; ++i) {
+//         const ggml_tensor * node = graph->nodes[i];
+//         OpStats stats = op_stats[node->op];
+
+//         // 행렬곱인 경우 요소당 FLOP 재계산
+//         if (node->op == GGML_OP_MUL_MAT) {
+//             int64_t K = node->ne[1];
+//             stats.flops_per_elem = 2.0 * K;
+//         }
+
+//         int64_t elems = ggml_nelements(node);
+//         size_t  type_size = ggml_type_size(node->type);
+
+//         double flops = stats.flops_per_elem * elems;
+//         double bytes = (double)type_size * elems * stats.n_src
+//                      + (stats.writes_dst ? (double)type_size * elems : 0.0);
+
+//         printf("node[%2d]: op=%-12s elems=%8lld  FLOP=%10.0f  Bytes=%10.0f  AI=%6.2f\n",
+//                i,
+//                ggml_op_name(node->op),
+//                (long long)elems,
+//                flops,
+//                bytes,
+//                flops / bytes);
+
+//         total_flops += flops;
+//         total_bytes += bytes;
+//     }
+
+//     printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.2f ===\n",
+//            total_flops, total_bytes, total_flops / total_bytes);
+// }
+
+
 void ggml_analyze_arithmetic_intensity(const ggml_cgraph * graph) {
-    double total_flops = 0.0;
-    double total_bytes = 0.0;
+    double total_flops  = 0.0;
+    double total_bytes  = 0.0;
 
     for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * node = graph->nodes[i];
-        OpStats stats = op_stats[node->op];
+        const ggml_tensor * dst  = graph->nodes[i];
+        OpStats stats            = op_stats[dst->op];
 
-        // 행렬곱인 경우 요소당 FLOP 재계산
-        if (node->op == GGML_OP_MUL_MAT) {
-            int64_t K = node->ne[1];
-            stats.flops_per_elem = 2.0 * K;
+        /* --- FLOPs ---------------------------------------------------- */
+        double flops = 0.0;
+        if (dst->op == GGML_OP_MUL_MAT) {
+            const ggml_tensor * A = dst->src[0];
+            const ggml_tensor * B = dst->src[1];
+            int64_t M = dst->ne[0];           // row
+            int64_t N = dst->ne[1];           // col
+            int64_t K = A->ne[0];             // 공통 차원 (A row == K)
+            flops = 2.0 * (double)M * N * K;  // 2*M*N*K
+        } else {
+            flops = stats.flops_per_elem * ggml_nelements(dst);
         }
 
-        int64_t elems = ggml_nelements(node);
-        size_t  type_size = ggml_type_size(node->type);
+        /* --- Bytes ---------------------------------------------------- */
+        double bytes = 0.0;
+        for (int si = 0; si < stats.n_src; ++si) {
+            bytes += ggml_nbytes(dst->src[si]);   // 입력별 실제 바이트
+        }
+        if (stats.writes_dst) {
+            bytes += ggml_nbytes(dst);
+        }
 
-        double flops = stats.flops_per_elem * elems;
-        double bytes = (double)type_size * elems * stats.n_src
-                     + (stats.writes_dst ? (double)type_size * elems : 0.0);
+        /* --- 출력 ---------------------------------------------------- */
+        double ai = bytes ? flops / bytes : 0.0;  // divide-by-zero guard
+        printf("node[%2d]: op=%-12s  FLOP=%12.0f  Bytes=%12.0f  AI=%6.2f\n",
+               i, ggml_op_name(dst->op), flops, bytes, ai);
 
-        printf("node[%2d]: op=%-12s elems=%8lld  FLOP=%10.0f  Bytes=%10.0f  AI=%6.2f\n",
-               i,
-               ggml_op_name(node->op),
-               (long long)elems,
-               flops,
-               bytes,
-               flops / bytes);
-
-        total_flops += flops;
-        total_bytes += bytes;
+        total_flops  += flops;
+        total_bytes  += bytes;
     }
 
-    printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.2f ===\n",
-           total_flops, total_bytes, total_flops / total_bytes);
+    double total_ai = total_bytes ? total_flops / total_bytes : 0.0;
+    printf("=== TOTAL:  FLOP=%0.f  Bytes=%0.f  AI=%0.2f ===\n",
+           total_flops, total_bytes, total_ai);
 }
+
+
 
 void maybe_probe_ai(const ggml_cgraph * graph) {
     // 요청 플래그가 false일 경우 아무 작업 없이 반환
