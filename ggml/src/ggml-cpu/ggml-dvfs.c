@@ -1,5 +1,8 @@
 #include "ggml-dvfs.h"
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* ---- 실제 전역 메모리 정의 ---- */
 _Atomic int g_op_freq_table[GGML_DVFS_MAX_OP] = {0};
@@ -7,8 +10,15 @@ _Atomic int g_op_freq_table[GGML_DVFS_MAX_OP] = {0};
 /* 내부 전용 – 현재 적용된 주파수 기록 */
 static _Atomic int g_applied_khz = 0;
 
+/* ---- NEW: 메모리 주파수 테이블 ---- */
+_Atomic int g_op_memfreq_table[GGML_DVFS_MAX_OP] = {0};
+
+/* NEW: 현재 적용된 메모리 주파수 기록 (kHz) */
+static _Atomic int g_applied_mem_khz = 0;
+
 /* forward decl. */
 static void set_cpu_freq(const char *freq_str);
+static void set_mem_freq(const char *freq_str);
 
 /* --------- 공개 API --------- */
 void ggml_dvfs_set(int op_id, int khz)
@@ -23,6 +33,16 @@ int ggml_dvfs_get(int op_id)
     if (op_id < 0 || op_id >= GGML_DVFS_MAX_OP) return 0;
     return atomic_load_explicit(&g_op_freq_table[op_id],
                                 memory_order_relaxed);
+}
+
+/* NEW: 공개 API (MEM) */
+void ggml_memfreq_set(int op_id, int khz) {
+    if (op_id < 0 || op_id >= GGML_DVFS_MAX_OP) return;
+    atomic_store_explicit(&g_op_memfreq_table[op_id], khz, memory_order_relaxed);
+}
+int ggml_memfreq_get(int op_id) {
+    if (op_id < 0 || op_id >= GGML_DVFS_MAX_OP) return 0;
+    return atomic_load_explicit(&g_op_memfreq_table[op_id], memory_order_relaxed);
 }
 
 /* --------- ggml 내부에서만 쓰이는 헬퍼 --------- */
@@ -41,6 +61,15 @@ void ggml_dvfs_apply_if_needed(int op_id)
         atomic_store_explicit(&g_applied_khz, want,
                               memory_order_relaxed);
     }
+    /* MEM (NEW) */
+    int want_mem = atomic_load_explicit(&g_op_memfreq_table[op_id], memory_order_relaxed);
+    if (want_mem > 0 &&
+        want_mem != atomic_load_explicit(&g_applied_mem_khz, memory_order_relaxed)) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", want_mem);   // kHz 그대로
+        set_mem_freq(buf); 
+        atomic_store_explicit(&g_applied_mem_khz, want_mem, memory_order_relaxed);
+    }
 #else
     (void)op_id;
 #endif
@@ -56,6 +85,21 @@ static void set_cpu_freq(const char *freq_str)
     };
     for (size_t i = 0; i < sizeof(cpus)/sizeof(cpus[0]); ++i) {
         FILE *f = fopen(cpus[i], "w");
+        if (f) { fprintf(f, "%s", freq_str); fclose(f); }
+    }
+#else
+    (void)freq_str;
+#endif
+}
+
+static void set_mem_freq(const char *freq_str)
+{
+#if defined(__gnu_linux__) || defined(__ANDROID__)
+    static const char *mems[] = {
+        "/sys/class/devfreq/170000a0.devfreq_bci/max_freq",
+    };
+    for (size_t i = 0; i < sizeof(mems)/sizeof(mems[0]); ++i) {
+        FILE *f = fopen(mems[i], "w");
         if (f) { fprintf(f, "%s", freq_str); fclose(f); }
     }
 #else

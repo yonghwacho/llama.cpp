@@ -3,6 +3,10 @@ include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
+# EWMA control knob for build
+option(GGML_AI_USE_EWMA "Use EWMA smoothing for arithmetic intensity" ON)
+set(GGML_AI_EWMA_ALPHA "0.20" CACHE STRING "EWMA alpha (0.0~1.0)")
+
 # enable libstdc++ assertions for debug builds
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     add_compile_definitions($<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS>)
@@ -187,7 +191,7 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
-add_library(ggml-base
+add_library(ggml-base STATIC
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
@@ -204,7 +208,8 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             gguf.cpp
-            arithmetic_intensity.cpp)
+            arithmetic_intensity.cpp
+            freq_ai_policy.cpp)
 
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_BACKEND_DL)
@@ -403,3 +408,11 @@ if (BUILD_SHARED_LIBS)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)
     endforeach()
 endif()
+
+# 파일 끝부분의 foreach (target ggml-base ggml)
+target_compile_definitions(ggml-base
+    PUBLIC
+        GGML_AI_EWMA_ALPHA=${GGML_AI_EWMA_ALPHA}
+        $<$<BOOL:${GGML_AI_USE_EWMA}>:GGML_AI_USE_EWMA=1>
+        $<$<NOT:$<BOOL:${GGML_AI_USE_EWMA}>>:GGML_AI_USE_EWMA=0>
+)
