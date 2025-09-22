@@ -2847,7 +2847,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_dvfs_apply_if_needed(node->op);   // sysfs write 1 회 or no‑op
         }
         //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
-
+        
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&

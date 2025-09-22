@@ -96,7 +96,7 @@ static void set_mem_freq(const char *freq_str)
 {
 #if defined(__gnu_linux__) || defined(__ANDROID__)
     static const char *mems[] = {
-        "/sys/class/devfreq/170000a0.devfreq_bci/max_freq",
+        "/sys/class/devfreq/17000010.devfreq_mif/max_freq",
     };
     for (size_t i = 0; i < sizeof(mems)/sizeof(mems[0]); ++i) {
         FILE *f = fopen(mems[i], "w");

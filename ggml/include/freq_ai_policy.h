@@ -78,6 +78,7 @@ public:
     void   update_system(const SystemSnapshot& sys);
     void   update_query (const QueryContext&   q);
     void   set_rl_hook  (RlHook hook);
+    static int clamp_int(int x, int lo, int hi);
 
     // op별로 호출: 현재 AI(EWMA) 기반으로 khz 결정. 쿨다운/히스테리시스 반영.
     Decision    decide_and_schedule(const OpContext& oc);

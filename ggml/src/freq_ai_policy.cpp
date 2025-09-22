@@ -3,7 +3,7 @@
 #include <cmath>
 #include <chrono>
 
-int FreqDecision::clamp_int(int x, int lo, int hi) const {
+int FreqDecision::clamp_int(int x, int lo, int hi) {
     return std::max(lo, std::min(hi, x));
 }
 
