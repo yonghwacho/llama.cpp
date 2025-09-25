@@ -148,3 +148,5 @@ node_test/
 # Local scripts
 /run-vim.sh
 /run-chat.sh
+
+/binary
