@@ -3095,6 +3095,8 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    // Minsung debug
+    // Note: Entrypoint of GGML CPU backend computation.
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
@@ -3108,6 +3110,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     if (threadpool == NULL) {
         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+        // Minsung debug
+        printf("init new threadpool with threads %d\n", n_threads);
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);

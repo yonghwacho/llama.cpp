@@ -6198,7 +6198,10 @@ int main(int argc, char ** argv) {
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
             // TODO: better value for n_threads
-            ggml_backend_set_n_threads_fn(backend, std::thread::hardware_concurrency());
+            // ggml_backend_set_n_threads_fn(backend, std::thread::hardware_concurrency());
+            // Minsung Debug
+            // Change number of threads here
+            ggml_backend_set_n_threads_fn(backend, 1);
         }
 
         size_t free, total;  // NOLINT

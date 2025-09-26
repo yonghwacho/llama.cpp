@@ -9,6 +9,7 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
@@ -144,13 +145,14 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
-
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 
     GGML_UNUSED(backend);
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    // Minsung debug
+    // Note: Entrypoint to GGML c++ CPU backend computation code.
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
