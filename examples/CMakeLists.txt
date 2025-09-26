@@ -11,6 +11,17 @@ find_package(Threads REQUIRED)
 llama_add_compile_flags()
 
 # examples
+# examples/CMakeLists.txt 내부 적당한 위치에
+add_executable(llama-state-chat
+    llama-state-chat.cpp
+)
+target_link_libraries(llama-state-chat PRIVATE common llama)
+target_compile_features(llama-state-chat PRIVATE cxx_std_17)
+set_target_properties(llama-state-chat PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+
 
 if (EMSCRIPTEN)
 else()
