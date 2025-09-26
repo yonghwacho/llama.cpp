@@ -1196,6 +1196,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    // Minsung debug
+    // printf("ggml_compute_forward_mul_mat \n");
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];

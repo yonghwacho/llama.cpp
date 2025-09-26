@@ -38,6 +38,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <iostream>
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
@@ -1256,10 +1257,15 @@ struct test_case {
         ggml_context_ptr ctx(ggml_init(params)); // smart ptr
         GGML_ASSERT(ctx);
 
+        // Minsung modified
+        // modified to get output tensor and bytes (to arithmetic intensity)
         ggml_tensor * out             = build_graph(ctx.get());
+        ggml_tensor * a = ggml_get_tensor(ctx.get(), "a");
+        ggml_tensor * b = ggml_get_tensor(ctx.get(), "b");
+
         std::string   current_op_name = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
-            //printf("  %s: skipping\n", op_desc(out).c_str());
+            printf("  %s: skipping\n", op_desc(out).c_str());
             return true;
         }
 
@@ -1343,6 +1349,7 @@ struct test_case {
         int64_t total_mem = 0;
         int total_runs = 0;
         do {
+            // std::cout << "ggml_backend_graph_compute" << "\n";
             int64_t start_time = ggml_time_us();
             ggml_status status = ggml_backend_graph_compute(backend, gf);
             if (status != GGML_STATUS_SUCCESS) {
@@ -1357,6 +1364,11 @@ struct test_case {
         } while (total_time_us < 1000*1000); // run for at least 1 second
 
         // Create test result
+        // size_t bytes_A = ggml_nbytes(a);
+        // size_t bytes_B = ggml_nbytes(b);
+        // size_t bytes_C = ggml_nbytes(out);
+        // double bytes_per_run = (double)bytes_A + (double)bytes_B + (double)bytes_C;
+        // double AI_flops_per_byte = op_flops(out) / bytes_per_run; 
         double avg_time_us      = (double) total_time_us / total_runs;
         double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
         double calculated_bandwidth =
@@ -1368,6 +1380,7 @@ struct test_case {
 
         if (output_printer) {
             output_printer->print_test_result(result);
+            // std::cout << "AI: " << AI_flops_per_byte << " FLOPS: " << op_flops(out) << " sizeA: " << bytes_A << " sizeB: " << bytes_B << " sizeC: " << bytes_C<< "\n";
         }
 
         return true;
@@ -5047,6 +5060,12 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
 };
 
+
+// Minsung modified
+static const ggml_type tllm_types[] = {
+    GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+};
+
 static const ggml_type base_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16,
     GGML_TYPE_Q8_0, // for I8MM tests
@@ -5951,8 +5970,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, true));
 
+    // Minsung modified
+    // Note: no need to test for all types
+    // for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
+    //     for (ggml_type type_a : all_types) {
+    //         for (ggml_type type_b : {GGML_TYPE_F32}) {
+    //             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+    //         }
+    //     }
+    // }
     for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
-        for (ggml_type type_a : all_types) {
+        for (ggml_type type_a : tllm_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
@@ -5971,7 +5999,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    for (int kv : { 4096, 8192, 16384, }) {
+    for (int kv : {128, 256, 512, 1024, 2048, 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
@@ -6051,6 +6079,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         filter_test_cases(test_cases, params_filter);
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_names_filter, output_printer);
+            
         }
         return true;
     }
@@ -6131,7 +6160,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-
+    std::cout << "what" << "\n";
     // load and enumerate backends
     ggml_backend_load_all();
 
@@ -6140,7 +6169,7 @@ int main(int argc, char ** argv) {
     if (output_printer) {
         output_printer->print_header();
     }
-
+    std::cout << "print test" << "\n";
     output_printer->print_testing_start(testing_start_info(ggml_backend_dev_count()));
 
     size_t n_ok = 0;
@@ -6177,7 +6206,7 @@ int main(int argc, char ** argv) {
         output_printer->print_backend_init(backend_init_info(i, ggml_backend_dev_count(), ggml_backend_dev_name(dev),
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
-
+        std::cout << "test begin" << "\n";
         bool ok = test_backend(backend, mode, op_names_filter, params_filter, output_printer.get());
 
         if (ok) {
@@ -6187,6 +6216,7 @@ int main(int argc, char ** argv) {
             backend_status_info(ggml_backend_name(backend), ok ? test_status_t::OK : test_status_t::FAIL));
 
         ggml_backend_free(backend);
+        std::cout << "test end" << "\n";
     }
 
     ggml_quantize_free();
@@ -6195,6 +6225,7 @@ int main(int argc, char ** argv) {
         output_printer->print_footer();
     }
 
+    std::cout << "save output" << "\n";
     output_printer->print_overall_summary(
         overall_summary_info(n_ok, ggml_backend_dev_count(), n_ok == ggml_backend_dev_count()));
 
@@ -6202,5 +6233,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::cout << "end" << "\n";
     return 0;
 }
