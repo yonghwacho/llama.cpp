@@ -1364,11 +1364,19 @@ struct test_case {
         } while (total_time_us < 1000*1000); // run for at least 1 second
 
         // Create test result
-        // size_t bytes_A = ggml_nbytes(a);
-        // size_t bytes_B = ggml_nbytes(b);
-        // size_t bytes_C = ggml_nbytes(out);
-        // double bytes_per_run = (double)bytes_A + (double)bytes_B + (double)bytes_C;
-        // double AI_flops_per_byte = op_flops(out) / bytes_per_run; 
+        
+            size_t bytes_A;
+            size_t bytes_B;
+            size_t bytes_C;
+            double bytes_per_run = 0;
+            double AI_flops_per_byte = 0;
+        if(current_op_name == "MUL_MAT"){
+            bytes_A = ggml_nbytes(a);
+            bytes_B = ggml_nbytes(b);
+            bytes_C = ggml_nbytes(out);
+            bytes_per_run = (double)bytes_A + (double)bytes_B + (double)bytes_C;
+            AI_flops_per_byte = op_flops(out) / bytes_per_run; 
+        }
         double avg_time_us      = (double) total_time_us / total_runs;
         double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
         double calculated_bandwidth =
@@ -1380,7 +1388,10 @@ struct test_case {
 
         if (output_printer) {
             output_printer->print_test_result(result);
-            // std::cout << "AI: " << AI_flops_per_byte << " FLOPS: " << op_flops(out) << " sizeA: " << bytes_A << " sizeB: " << bytes_B << " sizeC: " << bytes_C<< "\n";
+            if(current_op_name == "MUL_MAT"){
+                std::cout << "AI: " << AI_flops_per_byte << " FLOPS: " << op_flops(out) 
+                           << " sizeA: " << bytes_A << " sizeB: " << bytes_B << " sizeC: " << bytes_C<< "\n";
+            }
         }
 
         return true;
@@ -6109,11 +6120,15 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // Minsung note
+    // How to use:
+    // ./test-backend-ops perf -o MUL_MAT -b CPU -t 3
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
     const char * backend_filter = nullptr;
     const char * params_filter = nullptr;
+    int num_thread = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
@@ -6155,12 +6170,17 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
-        } else {
+        } else if (strcmp(argv[i], "-t") == 0){
+          if(i+1 < argc){
+            num_thread = std::stoi(argv[++i]);
+            std::cout << "Set thread number " << num_thread << "\n";
+          }
+        }
+         else {
             usage(argv);
             return 1;
         }
     }
-    std::cout << "what" << "\n";
     // load and enumerate backends
     ggml_backend_load_all();
 
@@ -6169,7 +6189,6 @@ int main(int argc, char ** argv) {
     if (output_printer) {
         output_printer->print_header();
     }
-    std::cout << "print test" << "\n";
     output_printer->print_testing_start(testing_start_info(ggml_backend_dev_count()));
 
     size_t n_ok = 0;
@@ -6201,7 +6220,7 @@ int main(int argc, char ** argv) {
             // ggml_backend_set_n_threads_fn(backend, std::thread::hardware_concurrency());
             // Minsung Debug
             // Change number of threads here
-            ggml_backend_set_n_threads_fn(backend, 1);
+            ggml_backend_set_n_threads_fn(backend, num_thread);
         }
 
         size_t free, total;  // NOLINT
