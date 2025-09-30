@@ -8099,7 +8099,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
         }
-
+        // if(mask){ // Minsung debug
+        //     printf("mask on f16\n");
+        // }else{
+        //     printf("mask off f16\n");
+        // }
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
@@ -8362,7 +8366,11 @@ static void ggml_compute_forward_flash_attn_back_f32(
                 for (int i = M; i < Mup; ++i) {
                     S[i] = -INFINITY;
                 }
-
+                // if(masked){ // Minsung debug
+                //     printf("mask on f32\n");
+                // }else{
+                //     printf("mask off f32\n");
+                // }
                 const int64_t masked_begin = masked ? (P + iq1 + 1) : M;
                 for (int64_t ic = 0; ic < masked_begin; ++ic) {
                     // k indices
