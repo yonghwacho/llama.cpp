@@ -28,10 +28,10 @@ cmake --install build-android --prefix binary_install
 
 # 4) Push to device
 echo "== Push binaries =="
-adb -s 46291FDAS006X7 push binary_install /data/local/tmp/mskim/
+adb -s 45211FDAS007DX push binary_install /data/local/tmp/mskim/
 
 # 5) Set LD_LIBRARY_PATH
-adb -s 46291FDAS006X7 shell "export LD_LIBRARY_PATH=/data/local/tmp/mskim/binary_install/lib:\$LD_LIBRARY_PATH"
+adb -s 45211FDAS007DX shell "export LD_LIBRARY_PATH=/data/local/tmp/mskim/binary_install/lib:\$LD_LIBRARY_PATH"
 
 echo "== Done =="
 

@@ -15,6 +15,19 @@
 // ##############################
 
 
+/*
+  SNU@NXC
+  Minsung Note: 
+  Modified version of test-backend-ops.cpp for tllm.
+  Todo:
+    1. Clean unused codes.
+    2. Get realistic parameters of Attentions.
+    3. Add calculation for AI(arithmatic intensity) of attention.
+    4. Parameterize Attention inputs.
+    5. Automate.
+*/
+
+
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
@@ -40,6 +53,46 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
+
+static inline void fill_causal_mask_f16(
+    ggml_tensor * KQ_mask,  // [n_kv, n_tokens, 1], type = F16
+    int n_kv,
+    int n_tokens,
+    int n_past,             // prefill: 0, decode: L
+    float neg_inf = -1e9f   // FP16에서도 충분히 큰 음수
+) {
+    GGML_ASSERT(KQ_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(KQ_mask->ne[0] == (int64_t)n_kv);
+    GGML_ASSERT(KQ_mask->ne[1] == (int64_t)n_tokens);
+    // ne[2] == 1 (heads로 broadcast)
+
+    ggml_fp16_t * data = (ggml_fp16_t *) KQ_mask->data;
+    const int64_t stride_k = 1;
+    const int64_t stride_t = KQ_mask->nb[1] / sizeof(ggml_fp16_t);
+
+    // for each query token i, allow keys k <= n_past + i
+    for (int t = 0; t < n_tokens; ++t) {
+        const int allowed_k_max = n_past + t;  // 핵심!
+        ggml_fp16_t * row = data + t * stride_t;
+
+        for (int k = 0; k < n_kv; ++k) {
+            const float val = (k <= allowed_k_max) ? 0.0f : neg_inf;
+            row[k * stride_k] = ggml_fp32_to_fp16(val);
+        }
+    }
+}
+
+static inline void fill_positions_i32(
+ggml_tensor * inp_pos,  // [n_tokens], type = I32
+int n_tokens,
+int base_pos            // prefill: 0, decode: n_past
+) {
+    GGML_ASSERT(inp_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(inp_pos->ne[0] == (int64_t)n_tokens);
+
+    int32_t * data = (int32_t *) inp_pos->data;
+    for (int i = 0; i < n_tokens; ++i) data[i] = base_pos + i;
+}
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
@@ -1288,17 +1341,23 @@ struct test_case {
     }
 
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
+        std::cout << "1" << "\n";
+        
         mode = MODE_PERF;
 
         static const size_t graph_nodes = 8192;
 
+        // 넉넉히 512MB (안되면 1GB까지 올려보세요)
+        const size_t MEM_POOL = 512ull * 1024 * 1024 * 8;
+
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
-            /* .mem_base = */ NULL,
+            /* .mem_size = */ MEM_POOL,
+            /* .mem_base = */ nullptr,
             /* .no_alloc = */ true,
         };
-        ggml_context_ptr ctx(ggml_init(params)); // smart ptr
+        ggml_context_ptr ctx(ggml_init(params));
         GGML_ASSERT(ctx);
+        std::cout << "2" << "\n";
 
         // Minsung modified
         // Note: modified to get output tensor and bytes (to arithmetic intensity)
@@ -1310,6 +1369,7 @@ struct test_case {
         ggml_tensor * k = ggml_get_tensor(ctx.get(), "k");
         ggml_tensor * v = ggml_get_tensor(ctx.get(), "v");
         ggml_tensor * m = ggml_get_tensor(ctx.get(), "m");
+        std::cout << "3" << "\n";
 
         std::string   current_op_name = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1326,20 +1386,41 @@ struct test_case {
         //     return true;
         // }
 
-        // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
+        // 2) backend로 실제 텐서 메모리 할당 (no_alloc=true 여야 함)
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        GGML_ASSERT(buf != nullptr);
+
+        // 3) 이름으로 pos/mask 텐서 찾기 (build_graph에서 ggml_set_name 해둔 전제)
+        ggml_tensor * pos  = ggml_get_tensor(ctx.get(), "pos");
+        ggml_tensor * mask = ggml_get_tensor(ctx.get(), "mask");
+        GGML_ASSERT(pos && mask);
+
+        // 4) 텐서 모양으로 런타임 파라미터 복원
+        const int n_tokens = (int) pos->ne[0];     // [n_tokens]
+        const int n_kv     = (int) mask->ne[0];    // [n_kv, n_tokens, 1]
+        int n_past         = n_kv - n_tokens;
+        if (n_past < 0) { n_past = 0; }            // 가드
+
+        // 5) (선택) 다른 텐서 랜덤 초기화가 pos/mask를 덮어쓰지 않도록 순서 조정
+        // initialize_tensors(ctx.get());  // 이게 pos/mask를 건드린다면, 이 호출을 앞당기거나 아예 빼세요.
+
+        // 6) 이제 실제로 값 채우기 (할당 이후에만!)
+        fill_positions_i32(pos,  n_tokens, n_past);
+        fill_causal_mask_f16(mask, n_kv, n_tokens, n_past);
 
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
             return false;
         }
 
+        std::cout << "4" << "\n";
         // randomize tensors
         initialize_tensors(ctx.get());
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
+        std::cout << "5" << "\n";
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -1347,6 +1428,7 @@ struct test_case {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
         }
+        std::cout << "6" << "\n";
 
         // determine number of runs
         int n_runs;
@@ -4485,16 +4567,21 @@ struct llama_hparams {
     float f_norm_eps;
     float f_norm_rms_eps;
 
-    // cparams
-    static constexpr uint32_t n_ctx = 512; // user-specified context size
-    static constexpr uint32_t n_ctx_orig = n_ctx;
+    // cparams (런타임 가변)
+    int32_t n_ctx       = 512;   // max context
+    int32_t n_ctx_orig  = n_ctx; // RoPE 보정용 원본
+    int32_t n_kv        = 32;    // 참조할 KV 길이(= n_past + n_tokens)
+    int32_t kv_head     = 1;     // 새 KV를 쓸 시작 index (보통 = n_past)
 
     // batch
     int32_t n_tokens;
 
+    // prefill/decode 제어용
+    int32_t n_past = 0;          // 과거 길이 L
+
     // llm_build_context
-    static constexpr int32_t n_kv    = 32; // size of KV cache to consider (n_kv <= n_ctx
-    static constexpr int32_t kv_head = 1;  // index of where we store new KV data in the cache
+    // static constexpr int32_t n_kv    = 32; // size of KV cache to consider (n_kv <= n_ctx
+    // static constexpr int32_t kv_head = 1;  // index of where we store new KV data in the cache
 
     uint32_t n_embd_gqa() const { // dimension of key embeddings across all k-v heads
         return n_embd_head * n_head_kv;
@@ -4549,6 +4636,58 @@ public:
         ggml_cpy(ctx, v_cur_t, v_cache_view);
     }
 
+    void llm_build_kv_store_modified(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_l,   // flat KV buffer for K
+        struct ggml_tensor  * v_l,   // flat KV buffer for V
+        struct ggml_tensor  * k_cur, // [head_dim, n_head_kv, n_tokens] (RoPE 적용됨)
+        struct ggml_tensor  * v_cur  // [head_dim, n_head_kv, n_tokens]
+        ) {
+        // 사전 조건: kv_head == n_past,  n_kv == n_past + n_tokens,  n_kv <= n_ctx
+        GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
+
+        // V는 [n_tokens, n_embd_gqa] 형태로 캐시에 누적 저장 (연속 pos 축 기준)
+        // v_cur: [head_dim, n_head_kv, n_tokens] -> [n_embd_gqa, n_tokens] -> transpose -> [n_tokens, n_embd_gqa]
+        struct ggml_tensor * v_cur_2d = ggml_reshape_2d(ctx, v_cur, hp.n_embd_gqa(), hp.n_tokens);
+        struct ggml_tensor * v_cur_t  = ggml_transpose(ctx, v_cur_2d);
+
+        // --- K 쓰기 뷰 ---
+        // K 캐시 레이아웃 가정:
+        //   [pos(=n_ctx) , channel(=n_embd_gqa)] 또는 동등한 평탄화.
+        // 여기서는 1D view로 (kv_head 위치부터) n_tokens * n_embd_gqa 요소를 연속 복사.
+        const size_t k_row_bytes = ggml_row_size(k_l->type, hp.n_embd_gqa());
+        const size_t k_off_bytes = k_row_bytes * hp.kv_head;
+
+        struct ggml_tensor * k_cache_view = ggml_view_1d(
+            ctx,
+            k_l,
+            (int64_t)hp.n_tokens * (int64_t)hp.n_embd_gqa(),
+            k_off_bytes
+        );
+
+        // --- V 쓰기 뷰 ---
+        // V 캐시 레이아웃 가정:
+        //   nb0 = elem_size
+        //   nb1 = elem_size * n_ctx  (행 하나가 'pos 축' stride)
+        //   nb2 = elem_size * n_ctx * n_embd_head  (head_dim 넘어가는 stride)
+        const size_t v_nb1 = (size_t)hp.n_ctx * ggml_element_size(v_l);
+        const size_t v_off = (size_t)hp.kv_head * ggml_element_size(v_l);
+
+        struct ggml_tensor * v_cache_view = ggml_view_2d(
+            ctx,
+            v_l,
+            /*ne0=*/hp.n_tokens,          // write length along pos
+            /*ne1=*/hp.n_embd_gqa(),      // channels
+            /*nb1=*/v_nb1,
+            /*offset=*/v_off
+        );
+
+        // 중요: K는 RoPE 적용본을 저장해야 함
+        ggml_cpy(ctx, k_cur,   k_cache_view);
+        ggml_cpy(ctx, v_cur_t, v_cache_view);
+    }
+
+
     struct ggml_tensor * llm_build_kqv(
             struct ggml_context * ctx,
              struct ggml_tensor * k_l,
@@ -4592,6 +4731,72 @@ public:
         return cur;
     }
 
+    struct ggml_tensor * llm_build_kqv_modified(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_l,      // flat K cache
+        struct ggml_tensor  * v_l,      // flat V cache
+        struct ggml_tensor  * q_cur,    // [head_dim, n_head, n_tokens] (permute 前)
+        struct ggml_tensor  * kq_mask,  // [n_kv, n_tokens, 1] (브로드캐스트)
+        float                 kq_scale  // 1/sqrt(head_dim)
+    ) {
+        // 사전 조건: n_kv == n_past + n_tokens, n_kv <= n_ctx
+        GGML_ASSERT(hp.n_kv <= hp.n_ctx);
+
+        // Q: [head_dim, n_head, n_tokens] -> (내부 곱 편의를 위해) permute
+        struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
+
+        // --- K 읽기 뷰 ---
+        // K 캐시를 [head_dim, n_kv, n_head_kv] 형태로 해석
+        // stride는 기존 코드와 동일한 방식 유지 (프로젝트의 캐시 배치 가정 준수)
+        struct ggml_tensor * k = ggml_view_3d(
+            ctx,
+            k_l,
+            /*ne0=*/hp.n_embd_head,                            // head_dim
+            /*ne1=*/hp.n_kv,                                   // seq len to attend
+            /*ne2=*/hp.n_head_kv,                              // kv heads
+            /*nb1=*/ggml_row_size(k_l->type, hp.n_embd_gqa()), // stride over seq
+            /*nb2=*/ggml_row_size(k_l->type, hp.n_embd_head),  // stride over kv_head
+            /*offset=*/0
+        );
+
+        // QK^T
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+
+        // softmax with mask (prefill/decode 공용)
+        // - prefill: causal N×N 마스크
+        // - decode : (L+1)×1 마스크 (과거 L 전부 + 현재 1)
+        // kq_mask가 nullptr이 아니면 그대로 사용, nullptr이면 외부에서 causal 처리했다고 가정
+        kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0.0f);
+
+        // --- V 읽기 뷰 ---
+        // V 캐시를 [n_kv, head_dim, n_head_kv]로 해석 (기존 코드 스타일 유지)
+        const size_t v_nb1 = (size_t)hp.n_ctx * ggml_element_size(v_l);
+        const size_t v_nb2 = v_nb1 * (size_t)hp.n_embd_head;
+
+        struct ggml_tensor * v = ggml_view_3d(
+            ctx,
+            v_l,
+            /*ne0=*/hp.n_kv,          // seq len to attend
+            /*ne1=*/hp.n_embd_head,   // head_dim
+            /*ne2=*/hp.n_head_kv,     // kv heads
+            /*nb1=*/v_nb1,
+            /*nb2=*/v_nb2,
+            /*offset=*/0
+        );
+
+        // kqv = V * softmax(QK^T)
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+
+        // 병합 및 출력 프로젝션
+        struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+        struct ggml_tensor * cur        = ggml_cont_2d(ctx, kqv_merged, hp.n_embd_head * hp.n_head, hp.n_tokens);
+
+        struct ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
+        cur = ggml_mul_mat(ctx, wo, cur);
+
+        return cur;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -4609,6 +4814,8 @@ public:
 };
 
 // Llama
+// Minsung Note:
+// Use this code to make attention roofline codes.
 struct test_llama : public test_llm {
     static constexpr float freq_base = 10000.0f;
     static constexpr float freq_scale = 1.0f;
@@ -4733,6 +4940,222 @@ struct test_llama : public test_llm {
 
         return cur;
     }
+};
+
+// Minsung Note:
+// Explicitly added for attention roofline test.
+struct test_attention : public test_llm {
+    static constexpr float freq_base  = 10000.0f;
+    static constexpr float freq_scale = 1.0f;
+    static constexpr float ext_factor = 0.0f;
+    static constexpr float attn_factor= 1.0f;
+    static constexpr float beta_fast  = 32.0f;
+    static constexpr float beta_slow  = 1.0f;
+    bool fused;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTENTION";
+    }
+
+    // n_tokens만 노출하던 기존 그대로 둬도 무방
+    std::string vars() override {
+        auto n_tokens = hp.n_tokens;
+        return VARS_TO_STR1(n_tokens);
+    }
+
+    double max_nmse_err() override { return 2e-3; }
+    bool run_whole_graph() override { return fused; }
+
+    // ─────────────────────────────────────────────────────────────
+    // 새 생성자:
+    //  - n_ctx, n_past, n_kv, kv_head 를 런타임으로 전달 가능
+    //  - n_kv / kv_head 를 음수로 넣으면 "자동 계산"
+    //      * n_kv    < 0  → n_kv = n_past + n_tokens
+    //      * kv_head < 0  → kv_head = n_past
+    //  - prefill 예:  n_past=0, n_tokens=T, (n_kv=-1), (kv_head=-1)
+    //  - decode  예:  n_past=L, n_tokens=1, (n_kv=-1), (kv_head=-1)
+    // ─────────────────────────────────────────────────────────────
+    test_attention(
+        int n_tokens     = 1,
+        int n_vocab      = 32000,
+        int n_embd       = 3200,
+        int n_head       = 32,
+        int n_head_kv    = 32,
+        // 런타임 컨텍스트/캐시 파라미터
+        int n_ctx        = 512,
+        int n_past       = 0,
+        int n_kv_runtime = -1,   // 자동: n_past + n_tokens
+        int kv_head_rt   = -1,   // 자동: n_past
+        // 기타 모델 하이퍼파라미터 (원래 기본값 유지)
+        int n_rot        = 100,
+        int n_embd_head  = 100,
+        int n_ff         = 8640,
+        bool fused       = false
+    )
+    : test_llm({
+        /*n_vocab        =*/ static_cast<uint32_t>(n_vocab),
+        /*n_embd         =*/ static_cast<uint32_t>(n_embd),
+        /*n_head         =*/ static_cast<uint32_t>(n_head),
+        /*n_head_kv      =*/ static_cast<uint32_t>(n_head_kv),
+        /*n_rot          =*/ static_cast<uint32_t>(n_rot),
+        /*n_embd_head    =*/ static_cast<uint32_t>(n_embd_head),
+        /*n_ff           =*/ static_cast<uint32_t>(n_ff),
+        /*f_norm_eps     =*/ 0.f,
+        /*f_norm_rms_eps =*/ 1e-5f,
+        /*n_tokens       =*/ n_tokens,
+      })
+    , fused(fused)
+    {
+        // 런타임 파라미터 설정
+        hp.n_ctx      = n_ctx;
+        hp.n_ctx_orig = n_ctx;
+        hp.n_past     = n_past;
+
+        // ★ 명시 재설정: 상위에서 리셋되는 경우 방지
+        hp.n_tokens   = n_tokens;
+
+        // 자동 계산
+        if (n_kv_runtime < 0) n_kv_runtime = n_past + n_tokens;
+        if (kv_head_rt   < 0) kv_head_rt   = n_past;
+
+        hp.n_kv    = n_kv_runtime;
+        hp.kv_head = kv_head_rt;
+
+        fprintf(stderr, "[ctor] n_ctx=%d n_past=%d n_tokens=%d n_kv=%d kv_head=%d\n",
+                hp.n_ctx, hp.n_past, hp.n_tokens, hp.n_kv, hp.kv_head);
+
+        GGML_ASSERT(hp.n_kv    >= 0);
+        GGML_ASSERT(hp.kv_head >= 0);
+        GGML_ASSERT(hp.n_kv    <= hp.n_ctx);
+        GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
+        GGML_ASSERT(hp.n_kv == hp.n_past + hp.n_tokens);
+    }
+    // 나머지 build_graph(), 기타 멤버는 기존(또는 이전에 드린 수정본) 그대로 사용
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+    // n_tokens가 0으로 리셋되었으면 복원
+    if (hp.n_tokens <= 0) {
+        // 가장 합리적 추론: n_tokens = n_kv - n_past  (prefill: n_kv=T, decode: 보통 1)
+        hp.n_tokens = std::max(1, hp.n_kv - hp.n_past);
+    }
+    std::cout << "A" << "\n";
+
+    // 불변식 강제
+    hp.n_kv    = hp.n_past + hp.n_tokens;
+    hp.kv_head = hp.n_past;
+
+    fprintf(stderr, "[build_graph:fixed] n_ctx=%d n_past=%d n_tokens=%d n_kv=%d kv_head=%d\n",
+            hp.n_ctx, hp.n_past, hp.n_tokens, hp.n_kv, hp.kv_head);
+
+    GGML_ASSERT(hp.n_kv    <= hp.n_ctx);
+    GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
+    GGML_ASSERT(hp.n_kv    == hp.n_past + hp.n_tokens);
+    GGML_ASSERT(hp.kv_head == hp.n_past);
+
+    struct ggml_tensor * cur;
+    struct ggml_tensor * inpL;
+    std::cout << "b" << "\n";
+
+    // [n_embd, n_tokens]
+    inpL = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, hp.n_tokens);
+
+    // positions: [n_tokens]; prefill: base=0, decode: base=n_past
+    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, hp.n_tokens);
+    ggml_set_name(inp_pos, "pos");        // ← 이름 부여
+
+    // KQ_mask: [n_kv, n_tokens, 1]  (브로드캐스트 전제)
+    struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hp.n_kv, hp.n_tokens, 1);
+    ggml_set_name(KQ_mask, "mask");       // ← 이름 부여
+
+    // KV 캐시 버퍼 크기 (n_layer 일반화)
+    const int64_t head_dim   = hp.n_embd_head;
+    const int64_t n_layers   = hp.n_layer;      // 1 in this harness
+    const int64_t kv_heads   = hp.n_head_kv;
+    const int64_t n_ctx_max  = hp.n_ctx;
+
+    const int64_t kv_elems_all = n_layers * kv_heads * head_dim * n_ctx_max;
+
+    std::cout << "c" << "\n";
+    ggml_tensor * k_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+    ggml_tensor * v_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+
+    std::cout << "d" << "\n";
+    for (uint32_t il = 0; il < hp.n_layer; ++il) {
+    std::cout << "e" << "\n";
+        struct ggml_tensor * inpSA = inpL;
+
+        // norm
+        ggml_tensor * attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+        cur = llm_build_norm(ctx, inpL, attn_norm, nullptr, LLM_NORM_RMS);
+
+        // self-attention
+        {
+            ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
+            ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
+            ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
+
+            // Q/K/V
+            struct ggml_tensor * Qcur = ggml_mul_mat(ctx, wq, cur);
+            struct ggml_tensor * Kcur = ggml_mul_mat(ctx, wk, cur);
+            struct ggml_tensor * Vcur = ggml_mul_mat(ctx, wv, cur);
+
+            // RoPE (positions는 prefill/decode에 따라 base가 다름)
+            Qcur = ggml_rope_ext(
+                ctx, ggml_reshape_3d(ctx, Qcur, hp.n_embd_head, hp.n_head,    hp.n_tokens), inp_pos, nullptr,
+                hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+            );
+            Kcur = ggml_rope_ext(
+                ctx, ggml_reshape_3d(ctx, Kcur, hp.n_embd_head, hp.n_head_kv, hp.n_tokens), inp_pos, nullptr,
+                hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+            );
+
+            // KV 저장: kv_head(=n_past) 오프셋에 기록
+            llm_build_kv_store_modified(ctx, k_l, v_l, Kcur, Vcur);
+
+            // 어텐션: n_kv 길이를 참조, 마스크는 이미 causal로 세팅됨
+            cur = llm_build_kqv_modified(ctx, k_l, v_l, Qcur, KQ_mask, 1.0f/sqrtf(float(hp.n_embd_head)));
+            std::cout << "f" << "\n";
+        }
+
+        struct ggml_tensor * ffn_inp = ggml_add(ctx, cur, inpSA);
+
+        // feed-forward network
+        ggml_tensor * ffn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+        cur = llm_build_norm(ctx, ffn_inp, ffn_norm, nullptr, LLM_NORM_RMS);
+
+        ggml_tensor * ffn_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_ff);
+        ggml_tensor * ffn_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_ff,   hp.n_embd);
+        ggml_tensor * ffn_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_ff);
+        struct ggml_tensor * tmp = ggml_mul_mat(ctx, ffn_up, cur);
+        cur = ggml_mul_mat(ctx, ffn_gate, cur);
+        cur = ggml_silu(ctx, cur);
+        cur = ggml_mul(ctx, cur, tmp);
+        cur = ggml_mul_mat(ctx, ffn_down, cur);
+
+        cur = ggml_add(ctx, cur, ffn_inp);
+
+        // input for next layer
+        inpL = cur;
+    std::cout << "g" << "\n";
+    }
+
+    std::cout << "g2" << "\n";
+
+    cur = inpL;
+
+    ggml_tensor * output_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+    cur = llm_build_norm(ctx, cur, output_norm, nullptr, LLM_NORM_RMS);
+
+    // lm_head
+    ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_vocab);
+    cur = ggml_mul_mat(ctx, output, cur);
+    std::cout << "g3" << "\n";
+
+    return cur;
+}
 };
 
 // Falcon
@@ -5842,6 +6265,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {256, 256, 3, 1}));
 
+
+    // Minsung modified
+    // Note: for attention test
+    test_cases.emplace_back(new test_attention(/*n_tokens=*/5,
+                 /*n_vocab=*/32000, /*n_embd=*/3200,
+                 /*n_head=*/32, /*n_head_kv=*/32,
+                 /*n_ctx=*/2048,   // 최대 컨텍스트
+                 /*n_past=*/0,
+                 /*n_kv_runtime=*/-1,  // 자동 → 0 + 512
+                 /*kv_head_rt=*/-1)  // 자동 → 0)
+    );
+
+
     return test_cases;
 }
 
@@ -5893,7 +6329,6 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         filter_test_cases(test_cases, params_filter);
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_names_filter, output_printer);
-            
         }
         return true;
     }
@@ -5972,6 +6407,7 @@ int main(int argc, char ** argv) {
             num_thread = std::stoi(argv[++i]);
             // std::cout << "Set thread number " << num_thread << "\n";
           }
+          // Todo: make attention option here.
         } else if (strcmp(argv[i], "-f") == 0){ // for frequency logging
               auto read_freq = [](const std::string &path) -> int {
                 std::ifstream file(path);
@@ -6054,10 +6490,11 @@ int main(int argc, char ** argv) {
         }
         output_printer->print_backend_status(
             backend_status_info(ggml_backend_name(backend), ok ? test_status_t::OK : test_status_t::FAIL));
-
+        std::cout << "h" << "\n";
         ggml_backend_free(backend);
     }
 
+    std::cout << "i" << "\n";
     ggml_quantize_free();
 
     if (output_printer) {
@@ -6070,6 +6507,7 @@ int main(int argc, char ** argv) {
     if (n_ok != ggml_backend_dev_count()) {
         return 1;
     }
+    std::cout << "j" << "\n";
 
 
     return 0;

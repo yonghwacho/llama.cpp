@@ -52,6 +52,7 @@ TEST_TARGETS = \
 	tests/test-arg-parser \
 	tests/test-autorelease \
 	tests/test-backend-ops \
+	tests/tllm_profiler \
 	tests/test-chat \
 	tests/test-chat-template \
 	tests/test-double-float \
@@ -1527,6 +1528,11 @@ tests/test-c.o: tests/test-c.c include/llama.h
 	$(CC) $(CFLAGS) -c $(filter-out %.h,$^) -o $@
 
 tests/test-backend-ops: tests/test-backend-ops.cpp \
+	$(OBJ_GGML)
+	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+
+tests/tllm_profiler: tests/tllm_profiler.cpp \
 	$(OBJ_GGML)
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
