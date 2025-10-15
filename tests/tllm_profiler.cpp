@@ -61,7 +61,90 @@ int glob_n_head_kv = 0;
 int glob_n_ctx = 0;
 int glob_n_past = 0;
 int glob_n_tokens  = 1;
+int glob_n_ff = 0; 
+int glob_subgraph = 0; // 0=attn, 1=ffn, 2=both
 
+
+
+// ---- FLOPs / Bytes for Attention & FFN ----
+//  - FLOPs: matmul 1 MAC = 2 FLOPs 가정
+//  - Bytes: 논리적 추정(가중치/활성), FP32 4B 기준 단순 상한 (정확 트래픽 요구 시 ggml_nbytes 합산으로 확장 가능)
+
+static inline double flops_attention_formula(
+    int n_embd, int n_head, int n_head_kv, int n_embd_head,
+    int n_tokens, int n_kv,
+    bool include_qkv_proj = true, bool include_wo = true, bool include_softmax = true) {
+
+    const double E   = n_embd;
+    const double H   = n_head;
+    const double HKV = n_head_kv;
+    const double D   = n_embd_head;          // 보통 E/H
+    const double N   = n_tokens;             // query 길이
+    const double L   = n_kv;                 // key 길이 (past + cur)
+    const double Ekv = D * HKV;
+
+    double flops = 0.0;
+    if (include_qkv_proj) {
+        flops += 2.0 * E * E   * N;   // Wq * X
+        flops += 2.0 * E * Ekv * N;   // Wk * X
+        flops += 2.0 * E * Ekv * N;   // Wv * X
+    }
+    flops += 2.0 * H * N * L * D;     // QK^T
+    if (include_softmax) flops += 5.0 * H * N * L; // exp+sum+div 근사
+    flops += 2.0 * H * N * L * D;     // (softmax)*V
+    if (include_wo) flops += 2.0 * E * E * N; // Wo
+    return flops;
+}
+
+static inline double bytes_attention_logical(
+    int n_embd, int n_head, int n_head_kv, int n_embd_head,
+    int n_tokens, int n_kv, bool prefill,
+    bool include_qkv_proj = true, bool include_wo = true) {
+
+    const double E   = n_embd;
+    const double HKV = n_head_kv;
+    const double D   = n_embd_head;
+    const double N   = n_tokens;
+    const double L   = n_kv;
+    const double Ekv = D * HKV;
+
+    double bytes_elem = 0.0;
+    if (include_qkv_proj) {
+        bytes_elem += (E*E);     // Wq
+        bytes_elem += (E*Ekv);   // Wk
+        bytes_elem += (E*Ekv);   // Wv
+    }
+    if (include_wo) {
+        bytes_elem += (E*E);     // Wo
+    }
+
+    // activations (아주 단순 상한):
+    bytes_elem += (E*N);         // X
+    bytes_elem += (E*N);         // Q
+    bytes_elem += (Ekv*N);       // K 생성분량(프리필은 N, 디코드는 1이지만 간단화)
+    bytes_elem += (Ekv*N);       // V 생성분량
+    bytes_elem += (N*L);         // attn
+
+    return bytes_elem * 4.0;     // FP32 상한 (양자화/실제 타입 반영하려면 ggml_nbytes로 대체)
+}
+
+static inline double flops_ffn_formula(int n_embd, int n_ff, int n_tokens) {
+    const double E = n_embd, F = n_ff, N = n_tokens;
+    double flops = 0.0;
+    flops += 2.0 * E * F * N; // up
+    flops += 2.0 * E * F * N; // gate
+    flops += 9.0 * F * N;     // silu + mul 근사
+    flops += 2.0 * F * E * N; // down
+    return flops;
+}
+
+static inline double bytes_ffn_logical(int n_embd, int n_ff, int n_tokens) {
+    const double E = n_embd, F = n_ff, N = n_tokens;
+    double bytes_elem = 0.0;
+    bytes_elem += (E*F) + (E*F) + (F*E); // weights up/gate/down
+    bytes_elem += (E*N) + (F*N)*3 + (E*N); // activations rough
+    return bytes_elem * 4.0;
+}
 
 static inline void fill_causal_mask_f16(
     ggml_tensor * KQ_mask,  // [n_kv, n_tokens, 1], type = F16
@@ -1350,138 +1433,143 @@ struct test_case {
     }
 
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
-        
+
         mode = MODE_PERF;
-
         static const size_t graph_nodes = 8192;
-
-        // 넉넉히 512MB (안되면 1GB까지 올려보세요)
         const size_t MEM_POOL = 512ull * 1024 * 1024 * 8;
 
-        ggml_init_params params = {
-            /* .mem_size = */ MEM_POOL,
-            /* .mem_base = */ nullptr,
-            /* .no_alloc = */ true,
-        };
+        ggml_init_params params = { MEM_POOL, nullptr, true };
         ggml_context_ptr ctx(ggml_init(params));
         GGML_ASSERT(ctx);
 
-        // Minsung modified
-        // Note: modified to get output tensor and bytes (to arithmetic intensity)
-        // Warning: stores NULLPTR if given tensor "xxx" not exists.
-        ggml_tensor * out             = build_graph(ctx.get());
+        ggml_tensor * out = build_graph(ctx.get());
+
         ggml_tensor * a = ggml_get_tensor(ctx.get(), "a");
         ggml_tensor * b = ggml_get_tensor(ctx.get(), "b");
-        ggml_tensor * q = ggml_get_tensor(ctx.get(), "q"); 
+        ggml_tensor * q = ggml_get_tensor(ctx.get(), "q");
         ggml_tensor * k = ggml_get_tensor(ctx.get(), "k");
         ggml_tensor * v = ggml_get_tensor(ctx.get(), "v");
         ggml_tensor * m = ggml_get_tensor(ctx.get(), "m");
 
-        std::string   current_op_name = op_desc(out);
-        if (!matches_filter(out, op_names_filter)) {
-            return true;
-        }
+        std::string current_op_name = op_desc(out);
+        if (!matches_filter(out, op_names_filter)) return true;
 
-        // if (!ggml_backend_supports_op(backend, out)) {
-        //     // Create test result for unsupported performance test
-        //     test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
-        //                        "not supported");
-
-        //     output_printer->print_test_result(result);
-
-        //     return true;
-        // }
-
-        // 2) backend로 실제 텐서 메모리 할당 (no_alloc=true 여야 함)
         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
         GGML_ASSERT(buf != nullptr);
 
-        // 3) 이름으로 pos/mask 텐서 찾기 (build_graph에서 ggml_set_name 해둔 전제)
         ggml_tensor * pos  = ggml_get_tensor(ctx.get(), "pos");
         ggml_tensor * mask = ggml_get_tensor(ctx.get(), "mask");
         GGML_ASSERT(pos && mask);
 
-        // 4) 텐서 모양으로 런타임 파라미터 복원
-        const int n_tokens = (int) pos->ne[0];     // [n_tokens]
-        const int n_kv     = (int) mask->ne[0];    // [n_kv, n_tokens, 1]
-        int n_past         = n_kv - n_tokens;
-        if (n_past < 0) { n_past = 0; }            // 가드
+        const int n_tokens = (int) pos->ne[0];
+        const int n_kv     = (int) mask->ne[0];
+        int n_past         = n_kv - n_tokens; if (n_past < 0) n_past = 0;
 
-        // 5) (선택) 다른 텐서 랜덤 초기화가 pos/mask를 덮어쓰지 않도록 순서 조정
-        // initialize_tensors(ctx.get());  // 이게 pos/mask를 건드린다면, 이 호출을 앞당기거나 아예 빼세요.
-
-        // 6) 이제 실제로 값 채우기 (할당 이후에만!)
+        // pos/mask 채우기
         fill_positions_i32(pos,  n_tokens, n_past);
         fill_causal_mask_f16(mask, n_kv, n_tokens, n_past);
 
-        if (buf == NULL) {
-            printf("failed to allocate tensors\n");
-            return false;
-        }
+        if (buf == NULL) { printf("failed to allocate tensors\n"); return false; }
 
-        // randomize tensors
         initialize_tensors(ctx.get());
 
-        // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
 
-        // warmup run
+        // warmup
         ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
         }
 
-        // determine number of runs
-        int n_runs;
+        // ─────────────────────────────────────────────────────────────
+        // ★★★ ATTENTION/FFN용 FLOPs & Bytes (한 run 기준) 계산
+        //     전역 파라미터 사용 (이미 -o ATTENTION 파서로 채워짐)
+        //     n_embd_head는 기본적으로 E/H로 산출
+        // ─────────────────────────────────────────────────────────────
+        const int   E   = (glob_n_embed   > 0 ? glob_n_embed   : 3072);
+        const int   H   = (glob_n_head    > 0 ? glob_n_head    : 24);
+        const int   HKV = (glob_n_head_kv > 0 ? glob_n_head_kv : H);
+        const int   D   = E / H;                        // head_dim
+        const int   N   = n_tokens;                     // query len
+        const int   L   = n_kv;                         // key len = past+cur
+        const bool  is_prefill = (n_past == 0);
+        const int   F   = (glob_n_ff > 0 ? glob_n_ff : (4 * E)); // FFN 차원 추정(미지정 시 4*E)
+
+        double model_flops_per_run = 0.0;
+        double bytes_per_run       = 0.0;
+
+        // ─────────────────────────────────────────────────────────────
+        // ★★★ 어떤 서브그래프인지에 따라 공식 적용
+        //     (op_desc(out)가 "ATTENTION" 또는 "FFN"을 내도록 test_attention/test_ffn에서 설정)
+        // ─────────────────────────────────────────────────────────────
+        bool is_attention_subgraph = (current_op_name == "ATTENTION");
+        bool is_ffn_subgraph       = (current_op_name == "FFN");
+
+        if (is_attention_subgraph) {
+            model_flops_per_run = flops_attention_formula(E, H, HKV, D, N, L, true, true, true);
+            bytes_per_run       = bytes_attention_logical(E, H, HKV, D, N, L, is_prefill, true, true);
+        } else if (is_ffn_subgraph) {
+            model_flops_per_run = flops_ffn_formula(E, F, N);
+            bytes_per_run       = bytes_ffn_logical(E, F, N);
+        } else {
+            // 기존 로직 유지 (MUL_MAT / FLASH_ATTN_EXT 등)
+            // 아래에서 다시 계산
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // n_runs 결정: ATTENTION/FFN이면 우리가 계산한 FLOPs 기준으로 타겟 러닝 시간 맞춤
+        // ─────────────────────────────────────────────────────────────
+        int n_runs = 1;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
-            // based on flops
-            const uint64_t GFLOP = 1000 * 1000 * 1000;
+
+        if (is_attention_subgraph || is_ffn_subgraph) {
+            const uint64_t GFLOP = 1000ull * 1000ull * 1000ull;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
             const uint64_t target_flops_gpu = 100ULL * GFLOP;
             uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-            n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
+            if (model_flops_per_run > 0.0) {
+                n_runs = std::max<int>(1, (int)(target_flops / model_flops_per_run));
+            }
         } else {
-            // based on memory size
-            const size_t GB = 1ULL << 30;
-            const size_t target_size_cpu =  8 * GB;
-            const size_t target_size_gpu = 32 * GB;
-            size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
-            n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+            // 기존 단일 op 경로 유지
+            if (op_flops(out) > 0) {
+                const uint64_t GFLOP = 1000 * 1000 * 1000;
+                const uint64_t target_flops_cpu =   8ULL * GFLOP;
+                const uint64_t target_flops_gpu = 100ULL * GFLOP;
+                uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
+                n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
+            } else {
+                const size_t GB = 1ULL << 30;
+                const size_t target_size_cpu =  8 * GB;
+                const size_t target_size_gpu = 32 * GB;
+                size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
+                n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+            }
         }
 
-        // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
         }
 
-        // calculate memory
+        // 기존 메모리 누적(그래프 기반)도 유지
         size_t mem = n_runs * op_size(out);
         auto tensor_op_size = [](ggml_tensor * t) {
             size_t size = ggml_nbytes(t);
-            // add source tensors
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (t->src[i] != NULL) {
-                    size += ggml_nbytes(t->src[i]);
-                }
-            }
+            for (int i = 0; i < GGML_MAX_SRC; i++) if (t->src[i] != NULL) size += ggml_nbytes(t->src[i]);
             return size;
         };
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) {
-                continue;
-            }
+            if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) continue;
             mem += tensor_op_size(ggml_graph_node(gf, i));
         }
 
-        // run
+        // 실행
         int64_t total_time_us = 0;
         int64_t total_mem = 0;
         int total_runs = 0;
         do {
-            // std::cout << "ggml_backend_graph_compute" << "\n";
             int64_t start_time = ggml_time_us();
             ggml_status status = ggml_backend_graph_compute(backend, gf);
             if (status != GGML_STATUS_SUCCESS) {
@@ -1489,52 +1577,57 @@ struct test_case {
                 return false;
             }
             int64_t end_time = ggml_time_us();
-
             total_time_us += end_time - start_time;
             total_mem += mem;
             total_runs += n_runs;
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+        } while (total_time_us < 1000*1000); // 최소 1초
 
-        // Create test result
-        
-            size_t bytes_A;
-            size_t bytes_B;
-            size_t bytes_C;
-            double bytes_per_run = 0;
-            double AI_flops_per_byte = 0;
-        if(current_op_name == "MUL_MAT"){
-            bytes_A = ggml_nbytes(a);
-            bytes_B = ggml_nbytes(b);
-            bytes_C = ggml_nbytes(out);
-            bytes_per_run = (double)bytes_A + (double)bytes_B + (double)bytes_C;
-            AI_flops_per_byte = op_flops(out) / bytes_per_run; 
-        }else if(current_op_name == "FLASH_ATTN_EXT"){
-            bytes_per_run = ggml_nbytes(q) + ggml_nbytes(k) + ggml_nbytes(v) \
-                     + ggml_nbytes(out) + (m ? ggml_nbytes(m) : 0);
-            AI_flops_per_byte = op_flops(out) / bytes_per_run; 
+        // ─────────────────────────────────────────────────────────────
+        // ★★★ 결과 계산: ATTENTION/FFN이면 우리 공식으로 AI/GFLOPS 산출
+        // ─────────────────────────────────────────────────────────────
+        double avg_time_us = (double) total_time_us / total_runs;
+
+        double AI_flops_per_byte = 0.0;
+        double calculated_flops  = 0.0; // [FLOP/s]
+        double calculated_bandwidth = 0.0;
+
+        if (is_attention_subgraph || is_ffn_subgraph) {
+            const double secs = total_time_us / 1e6;
+            const double total_flops = model_flops_per_run * total_runs;
+            calculated_flops = total_flops / secs;                 // FLOP/s
+            AI_flops_per_byte = (bytes_per_run > 0.0) ? (model_flops_per_run / bytes_per_run) : 0.0;
+            calculated_bandwidth = 0.0; // 필요시 bytes_per_run * total_runs / secs 로 추정 가능
+        } else {
+            // 기존 단일 op 경로
+            if (current_op_name == "MUL_MAT") {
+                size_t bytes_A = ggml_nbytes(a);
+                size_t bytes_B = ggml_nbytes(b);
+                size_t bytes_C = ggml_nbytes(out);
+                double bytes_per_run = (double)bytes_A + (double)bytes_B + (double)bytes_C;
+                AI_flops_per_byte = op_flops(out) / bytes_per_run;
+            } else if (current_op_name == "FLASH_ATTN_EXT") {
+                double bytes_per_run = ggml_nbytes(q) + ggml_nbytes(k) + ggml_nbytes(v)
+                                    + ggml_nbytes(out) + (m ? ggml_nbytes(m) : 0);
+                AI_flops_per_byte = op_flops(out) / bytes_per_run;
+            }
+            calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
+            calculated_bandwidth = (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
         }
-        double avg_time_us      = (double) total_time_us / total_runs;
-        double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
-        double calculated_bandwidth =
-            (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
+
         size_t calculated_memory_kb = op_size(out) / 1024;
 
-        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
-                           calculated_flops, AI_flops_per_byte, calculated_bandwidth, calculated_memory_kb, total_runs);
+        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "",
+                          avg_time_us,
+                          calculated_flops,          // FLOP/s
+                          AI_flops_per_byte,         // AI
+                          calculated_bandwidth,      // BW (op-only 경로에서만)
+                          calculated_memory_kb, total_runs);
 
-        if (output_printer) {
-            output_printer->print_test_result(result);
-            // if(current_op_name == "MUL_MAT"){
-            //     // std::cout << "AI: " << AI_flops_per_byte << " FLOPS: " << op_flops(out) 
-            //     //            << " sizeA: " << bytes_A << " sizeB: " << bytes_B << " sizeC: " << bytes_C<< "\n";
-            // }else if(current_op_name == "FLASH_ATTN_EXT"){
-            //     std::cout << "AI: " << AI_flops_per_byte << " FLOPS: " << op_flops(out) 
-            //                << " bytes: " << bytes_per_run << "\n";
-            // }
-        }
+        if (output_printer) output_printer->print_test_result(result);
 
         return true;
     }
+
 
     bool eval_support(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
         mode = MODE_SUPPORT;
@@ -4947,225 +5040,180 @@ struct test_llama : public test_llm {
 
 // Minsung Note:
 // Explicitly added for attention roofline test.
+// tensor bytes
+static inline size_t tensor_nbytes_rows(const ggml_tensor * t) {
+    size_t rowsz = ggml_row_size(t->type, t->ne[0]);
+    return rowsz * (size_t)std::max<int64_t>(1, t->ne[1]);
+}
+
+
+enum class Subgraph {
+    AttentionOnly,
+    FFNOnly,
+    AttentionThenFFN, 
+};
+
 struct test_attention : public test_llm {
-    // static constexpr float freq_base  = 10000.0f;
-    static constexpr float freq_base  = 500000; // For same test env with LLAMA3-8b-Q8
+    static constexpr float freq_base  = 500000;
     static constexpr float freq_scale = 1.0f;
     static constexpr float ext_factor = 0.0f;
     static constexpr float attn_factor= 1.0f;
     static constexpr float beta_fast  = 32.0f;
     static constexpr float beta_slow  = 1.0f;
+
     bool fused;
+    Subgraph subgraph;  
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
+        switch (subgraph) {
+            case Subgraph::AttentionOnly:    return "ATTENTION";
+            case Subgraph::FFNOnly:          return "FFN";
+            case Subgraph::AttentionThenFFN: return "ATTN_FFN"; // 둘 다일 때 구분용
+        }
         return "ATTENTION";
     }
-
-    // n_tokens만 노출하던 기존 그대로 둬도 무방
-    std::string vars() override {
-        auto n_tokens = hp.n_tokens;
-        return VARS_TO_STR1(n_tokens);
-    }
-
+    std::string vars() override { return VARS_TO_STR1(hp.n_tokens); }
     double max_nmse_err() override { return 2e-3; }
     bool run_whole_graph() override { return fused; }
 
-    // ─────────────────────────────────────────────────────────────
-    // 새 생성자:
-    //  - n_ctx, n_past, n_kv, kv_head 를 런타임으로 전달 가능
-    //  - n_kv / kv_head 를 음수로 넣으면 "자동 계산"
-    //      * n_kv    < 0  → n_kv = n_past + n_tokens
-    //      * kv_head < 0  → kv_head = n_past
-    //  - prefill 예:  n_past=0, n_tokens=T, (n_kv=-1), (kv_head=-1)
-    //  - decode  예:  n_past=L, n_tokens=1, (n_kv=-1), (kv_head=-1)
-    // ─────────────────────────────────────────────────────────────
     test_attention(
         int n_tokens     = 1,
         int n_vocab      = 32000,
         int n_embd       = 3200,
         int n_head       = 32,
         int n_head_kv    = 32,
-        // 런타임 컨텍스트/캐시 파라미터
         int n_ctx        = 512,
         int n_past       = 0,
-        int n_kv_runtime = -1,   // 자동: n_past + n_tokens
-        int kv_head_rt   = -1,   // 자동: n_past
-        // 기타 모델 하이퍼파라미터 (원래 기본값 유지)
+        int n_kv_runtime = -1,
+        int kv_head_rt   = -1,
         int n_rot        = 100,
         int n_embd_head  = 100,
         int n_ff         = 8640,
         int n_embd_head_override = -1,
         int n_rot_override = -1,
-        bool fused       = false
+        bool fused       = false,
+        Subgraph sg      = Subgraph::AttentionOnly    
     )
     : test_llm({
-        /*n_vocab        =*/ static_cast<uint32_t>(n_vocab),
-        /*n_embd         =*/ static_cast<uint32_t>(n_embd),
-        /*n_head         =*/ static_cast<uint32_t>(n_head),
-        /*n_head_kv      =*/ static_cast<uint32_t>(n_head_kv),
-        /*n_rot          =*/ static_cast<uint32_t>(n_rot),
-        /*n_embd_head    =*/ static_cast<uint32_t>(n_embd_head),
-        /*n_ff           =*/ static_cast<uint32_t>(n_ff),
-        /*f_norm_eps     =*/ 0.f,
-        /*f_norm_rms_eps =*/ 1e-5f,
-        /*n_tokens       =*/ n_tokens,
+        (uint32_t)n_vocab, (uint32_t)n_embd, (uint32_t)n_head, (uint32_t)n_head_kv,
+        (uint32_t)n_rot, (uint32_t)n_embd_head, (uint32_t)n_ff, 0.f, 1e-5f, n_tokens
       })
     , fused(fused)
+    , subgraph(sg)
     {
-        // 런타임 파라미터 설정
         hp.n_ctx      = n_ctx;
         hp.n_ctx_orig = n_ctx;
         hp.n_past     = n_past;
-
-        // ★ 명시 재설정: 상위에서 리셋되는 경우 방지
         hp.n_tokens   = n_tokens;
 
-        // 자동 계산
         if (n_kv_runtime < 0) n_kv_runtime = n_past + n_tokens;
         if (kv_head_rt   < 0) kv_head_rt   = n_past;
-
         hp.n_kv    = n_kv_runtime;
         hp.kv_head = kv_head_rt;
-        // ★★★ 핵심: head_dim 설정
+
         int computed_head = hp.n_embd / (int)hp.n_head;
-        if (n_embd_head_override > 0) {
-            hp.n_embd_head = n_embd_head_override;
-        } else {
-            hp.n_embd_head = computed_head;      // ← 자동 계산
-        }
+        hp.n_embd_head = (n_embd_head_override > 0) ? n_embd_head_override : computed_head;
 
-        // RoPE dim도 모델에 맞추고 싶으면 여기서 맞춤 (Llama-3.2: 128)
-        if (n_rot_override > 0) {
-            hp.n_rot = (uint32_t)n_rot_override;
-        } else {
-            hp.n_rot = (uint32_t)hp.n_embd_head; // 보수적 기본: head_dim과 동일
-        }
+        hp.n_rot = (n_rot_override > 0) ? (uint32_t)n_rot_override : (uint32_t)hp.n_embd_head;
 
-        // 정합성 assert
-        GGML_ASSERT(hp.n_embd % hp.n_head == 0);                  // Q reshape 조건
+        GGML_ASSERT(hp.n_embd % hp.n_head == 0);
         GGML_ASSERT(hp.n_embd_head * hp.n_head == hp.n_embd);
         GGML_ASSERT((int)hp.n_embd_gqa() == (int)hp.n_embd_head * (int)hp.n_head_kv);
         GGML_ASSERT(hp.n_kv == hp.n_past + hp.n_tokens);
         GGML_ASSERT(hp.n_kv <= hp.n_ctx);
         GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
     }
-    // 나머지 build_graph(), 기타 멤버는 기존(또는 이전에 드린 수정본) 그대로 사용
+
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-    // n_tokens가 0으로 리셋되었으면 복원
-    if (hp.n_tokens <= 0) {
-        // 가장 합리적 추론: n_tokens = n_kv - n_past  (prefill: n_kv=T, decode: 보통 1)
-        hp.n_tokens = std::max(1, hp.n_kv - hp.n_past);
-    }
+    std::cout << "build_graph" << "\n";
 
-    // 불변식 강제
+    if (hp.n_tokens <= 0) hp.n_tokens = std::max(1, hp.n_kv - hp.n_past);
     hp.n_kv    = hp.n_past + hp.n_tokens;
     hp.kv_head = hp.n_past;
 
-    fprintf(stderr, "[build_graph:fixed] n_ctx=%d n_past=%d n_tokens=%d n_kv=%d kv_head=%d\n",
-            hp.n_ctx, hp.n_past, hp.n_tokens, hp.n_kv, hp.kv_head);
+    // 입력
+    ggml_tensor * X       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, hp.n_tokens);
+    ggml_set_name(X, "X");
 
-    GGML_ASSERT(hp.n_kv    <= hp.n_ctx);
-    GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
-    GGML_ASSERT(hp.n_kv    == hp.n_past + hp.n_tokens);
-    GGML_ASSERT(hp.kv_head == hp.n_past);
+    ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, hp.n_tokens);
+    ggml_set_name(inp_pos, "pos");            // ★ 이름만, 여기서는 값을 채우지 않음
 
-    struct ggml_tensor * cur;
-    struct ggml_tensor * inpL;
+    ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hp.n_kv, hp.n_tokens, 1);
+    ggml_set_name(KQ_mask, "mask");           // ★ 이름만, 여기서는 값을 채우지 않음
 
-    // [n_embd, n_tokens]
-    inpL = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, hp.n_tokens);
-
-    // positions: [n_tokens]; prefill: base=0, decode: base=n_past
-    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, hp.n_tokens);
-    ggml_set_name(inp_pos, "pos");        // ← 이름 부여
-
-    // KQ_mask: [n_kv, n_tokens, 1]  (브로드캐스트 전제)
-    struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hp.n_kv, hp.n_tokens, 1);
-    ggml_set_name(KQ_mask, "mask");       // ← 이름 부여
-
-    // KV 캐시 버퍼 크기 (n_layer 일반화)
-    const int64_t head_dim   = hp.n_embd_head;
-    const int64_t n_layers   = hp.n_layer;      // 1 in this harness
-    const int64_t kv_heads   = hp.n_head_kv;
-    const int64_t n_ctx_max  = hp.n_ctx;
-
-    const int64_t kv_elems_all = n_layers * kv_heads * head_dim * n_ctx_max;
-
+    // KV 버퍼
+    const int64_t kv_elems_all = (int64_t)hp.n_layer * hp.n_head_kv * hp.n_embd_head * hp.n_ctx;
     ggml_tensor * k_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
     ggml_tensor * v_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+    ggml_set_name(k_l, "k_cache");
+    ggml_set_name(v_l, "v_cache");
 
-    for (uint32_t il = 0; il < hp.n_layer; ++il) {
-        struct ggml_tensor * inpSA = inpL;
+    ggml_tensor * cur = X;
 
-        // norm
-        ggml_tensor * attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
-        cur = llm_build_norm(ctx, inpL, attn_norm, nullptr, LLM_NORM_RMS);
+    // 정규화 (원하면 제거 가능)
+    ggml_tensor * ln_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+    ggml_set_name(ln_w, "ln_w");
+    cur = llm_build_norm(ctx, cur, ln_w, nullptr, LLM_NORM_RMS);
 
-        // self-attention
-        {
-            ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
-            ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
-            ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
+    // Attention subgraph
+    auto build_attention_only = [&](ggml_tensor * inp) -> ggml_tensor * {
+        std::cout << "build_attention_only" << "\n";
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
+        ggml_set_name(wq, "wq"); ggml_set_name(wk, "wk"); ggml_set_name(wv, "wv"); ggml_set_name(wo, "wo");
 
-            // Q/K/V
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx, wq, cur);
-            struct ggml_tensor * Kcur = ggml_mul_mat(ctx, wk, cur);
-            struct ggml_tensor * Vcur = ggml_mul_mat(ctx, wv, cur);
+        ggml_tensor * Q = ggml_mul_mat(ctx, wq, inp); ggml_set_name(Q, "Q_mm");
+        ggml_tensor * K = ggml_mul_mat(ctx, wk, inp); ggml_set_name(K, "K_mm");
+        ggml_tensor * V = ggml_mul_mat(ctx, wv, inp); ggml_set_name(V, "V_mm");
 
-            // RoPE (positions는 prefill/decode에 따라 base가 다름)
-            Qcur = ggml_rope_ext(
-                ctx, ggml_reshape_3d(ctx, Qcur, hp.n_embd_head, hp.n_head,    hp.n_tokens), inp_pos, nullptr,
-                hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow
-            );
-            Kcur = ggml_rope_ext(
-                ctx, ggml_reshape_3d(ctx, Kcur, hp.n_embd_head, hp.n_head_kv, hp.n_tokens), inp_pos, nullptr,
-                hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow
-            );
+        Q = ggml_rope_ext(ctx, ggml_reshape_3d(ctx, Q, hp.n_embd_head, hp.n_head,    hp.n_tokens),
+                          inp_pos, nullptr, hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        ggml_set_name(Q, "Q_rope");
 
-            // KV 저장: kv_head(=n_past) 오프셋에 기록
-            llm_build_kv_store_modified(ctx, k_l, v_l, Kcur, Vcur);
+        K = ggml_rope_ext(ctx, ggml_reshape_3d(ctx, K, hp.n_embd_head, hp.n_head_kv, hp.n_tokens),
+                          inp_pos, nullptr, hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        ggml_set_name(K, "K_rope");
 
-            // 어텐션: n_kv 길이를 참조, 마스크는 이미 causal로 세팅됨
-            cur = llm_build_kqv_modified(ctx, k_l, v_l, Qcur, KQ_mask, 1.0f/sqrtf(float(hp.n_embd_head)));
-        }
+        llm_build_kv_store_modified(ctx, k_l, v_l, K, V);
 
-        struct ggml_tensor * ffn_inp = ggml_add(ctx, cur, inpSA);
+        ggml_tensor * attn_out = llm_build_kqv_modified(ctx, k_l, v_l, Q, KQ_mask, 1.0f/std::sqrt((float)hp.n_embd_head));
+        ggml_set_name(attn_out, "attn_out");
 
-        // feed-forward network
-        ggml_tensor * ffn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
-        cur = llm_build_norm(ctx, ffn_inp, ffn_norm, nullptr, LLM_NORM_RMS);
+        ggml_tensor * out = ggml_mul_mat(ctx, wo, attn_out);
+        ggml_set_name(out, "attn_out_wo");
+        return out;
+    };
 
-        ggml_tensor * ffn_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_ff);
-        ggml_tensor * ffn_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_ff,   hp.n_embd);
-        ggml_tensor * ffn_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_ff);
-        struct ggml_tensor * tmp = ggml_mul_mat(ctx, ffn_up, cur);
-        cur = ggml_mul_mat(ctx, ffn_gate, cur);
-        cur = ggml_silu(ctx, cur);
-        cur = ggml_mul(ctx, cur, tmp);
-        cur = ggml_mul_mat(ctx, ffn_down, cur);
+    // FFN subgraph
+    auto build_ffn_only = [&](ggml_tensor * inp) -> ggml_tensor * {
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_ff);
+        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_ff);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_ff,   hp.n_embd);
+        ggml_set_name(w_up, "w_up"); ggml_set_name(w_gate, "w_gate"); ggml_set_name(w_down, "w_down");
 
-        cur = ggml_add(ctx, cur, ffn_inp);
+        ggml_tensor * up    = ggml_mul_mat(ctx, w_up,   inp); ggml_set_name(up,   "ffn_up");
+        ggml_tensor * gate  = ggml_mul_mat(ctx, w_gate, inp); ggml_set_name(gate, "ffn_gate");
+        ggml_tensor * act   = ggml_silu(ctx, gate);           ggml_set_name(act,  "ffn_silu");
+        ggml_tensor * fused = ggml_mul(ctx, act, up);         ggml_set_name(fused,"ffn_mul");
+        ggml_tensor * out   = ggml_mul_mat(ctx, w_down, fused); ggml_set_name(out,"ffn_down");
+        return out;
+    };
 
-        // input for next layer
-        inpL = cur;
+    if (subgraph == Subgraph::AttentionOnly) {
+        cur = build_attention_only(cur);
+    } else if (subgraph == Subgraph::FFNOnly) {
+        cur = build_ffn_only(cur);
+    } else {
+        cur = build_attention_only(cur);
+        cur = build_ffn_only(cur);
     }
-
-
-    cur = inpL;
-
-    ggml_tensor * output_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
-    cur = llm_build_norm(ctx, cur, output_norm, nullptr, LLM_NORM_RMS);
-
-    // lm_head
-    ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_vocab);
-    cur = ggml_mul_mat(ctx, output, cur);
-
     return cur;
 }
+
 };
 
 // Falcon
@@ -6278,6 +6326,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Minsung modified
     // Note: for attention test
+    Subgraph sg = Subgraph::AttentionOnly;
+    if (glob_subgraph == 1) sg = Subgraph::FFNOnly;
+    else if (glob_subgraph == 2) sg = Subgraph::AttentionThenFFN;
+
     test_cases.emplace_back(new test_attention(
         /*n_tokens=*/glob_n_tokens,
         /*n_vocab=*/ (glob_n_vocab   ? glob_n_vocab   : 32000),
@@ -6286,9 +6338,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         /*n_head_kv*/(glob_n_head_kv ? glob_n_head_kv : 32),
         /*n_ctx=*/   (glob_n_ctx      ? glob_n_ctx      : 512),
         /*n_past=*/   glob_n_past,
-        /*n_kv_runtime=*/-1,  // 자동: n_past + n_tokens
-        /*kv_head_rt=*/ -1    // 자동: n_past
+        /*n_kv_runtime=*/-1,
+        /*kv_head_rt=*/ -1,
+        /*n_rot*/ 100,
+        /*n_embd_head*/ 100,
+        /*n_ff*/ (glob_n_ff ? glob_n_ff : 4*(glob_n_embed ? glob_n_embed : 3200)),
+        /*n_embd_head_override=*/-1,
+        /*n_rot_override=*/-1,
+        /*fused=*/false,
+        /*sg=*/sg
     ));
+
 
     return test_cases;
 }
@@ -6465,24 +6525,64 @@ int main(int argc, char ** argv) {
                         }
                         return false;
                     };
+                    // ★ 문자값 파싱 헬퍼 (예: sg=attn / ffn / both)
+                    auto parse_kv_str = [](const char * s, const char * key, std::string & out) -> bool {
+                        size_t klen = strlen(key);
+                        if (strncmp(s, key, klen) == 0 && s[klen] == '=') {
+                            out = std::string(s + klen + 1);
+                            return true;
+                        }
+                        return false;
+                    };
 
                     // 다음 옵션(-로 시작) 나오기 전까지 key=value 소비
                     while (i + 1 < argc && argv[i + 1][0] != '-') {
                         const char * tok = argv[++i];
 
                         // 지원하는 키들:
-                        // n_vocab, n_embd, n_head, n_head_kv, n_ctx, n_past, n_tokens
+                        // n_vocab, n_embd, n_head, n_head_kv, n_ctx, n_past, n_tokens, sg
                         if (parse_kv(tok, "n_vocab",    glob_n_vocab))   continue;
                         if (parse_kv(tok, "n_embd",     glob_n_embed))   continue;
                         if (parse_kv(tok, "n_head",     glob_n_head))    continue;
                         if (parse_kv(tok, "n_head_kv",  glob_n_head_kv)) continue;
-                        if (parse_kv(tok, "n_ctx",      glob_n_ctx))      continue;
+                        if (parse_kv(tok, "n_ctx",      glob_n_ctx))     continue;
                         if (parse_kv(tok, "n_past",     glob_n_past))    continue;
                         if (parse_kv(tok, "n_tokens",   glob_n_tokens))  continue;
 
+                        // ★ sg= 문자열/숫자 모두 지원
+                        {
+                            std::string sg_str;
+                            if (parse_kv_str(tok, "sg", sg_str)) {
+                                // 문자열 케이스
+                                if (sg_str == "attn" || sg_str == "ATTN" || sg_str == "attention") {
+                                    glob_subgraph = 0;
+                                } else if (sg_str == "ffn" || sg_str == "FFN") {
+                                    glob_subgraph = 1;
+                                } else if (sg_str == "both" || sg_str == "all" || sg_str == "ATTN_FFN") {
+                                    glob_subgraph = 2;
+                                } else {
+                                    // 숫자도 허용: 0/1/2
+                                    try {
+                                        glob_subgraph = std::stoi(sg_str);
+                                    } catch (...) {
+                                        std::cerr << "[ATTENTION] sg invalid: " << sg_str
+                                                  << " (use sg=attn|ffn|both or sg=0|1|2). Defaulting to attn.\n";
+                                        glob_subgraph = 0;
+                                    }
+                                }
+                                // 범위 클램프
+                                if (glob_subgraph < 0 || glob_subgraph > 2) {
+                                    std::cerr << "[ATTENTION] sg out of range: " << glob_subgraph
+                                              << " (valid 0/1/2). Defaulting to 0(attn).\n";
+                                    glob_subgraph = 0;
+                                }
+                                continue;
+                            }
+                        }
+
                         // 알 수 없는 토큰은 경고만
                         std::cerr << "[ATTENTION] Unknown arg: " << tok
-                                << " (expected key=value such as n_ctx=2048)\n";
+                                  << " (expected key=value such as n_ctx=2048 or sg=attn)\n";
                     }
 
                     // 기본값/유효성 간단 체크 (필요하면 강화)
@@ -6499,17 +6599,19 @@ int main(int argc, char ** argv) {
                         glob_n_past = 0;
                     }
 
-                    // 참고 출력(선택)
+                    // 참고 출력
+                    const char * sg_name = (glob_subgraph == 0 ? "attn" :
+                                            glob_subgraph == 1 ? "ffn"  : "both");
                     std::cout << "[ATTENTION] n_vocab="    << glob_n_vocab
-                            << " n_embd="                << glob_n_embed
-                            << " n_head="                << glob_n_head
-                            << " n_head_kv="             << glob_n_head_kv
-                            << " n_ctx="                 << glob_n_ctx
-                            << " n_past="                << glob_n_past
-                            << " n_tokens="              << glob_n_tokens
-                            << "\n";
+                              << " n_embd="                << glob_n_embed
+                              << " n_head="                << glob_n_head
+                              << " n_head_kv="             << glob_n_head_kv
+                              << " n_ctx="                 << glob_n_ctx
+                              << " n_past="                << glob_n_past
+                              << " n_tokens="              << glob_n_tokens
+                              << " sg="                    << sg_name
+                              << "\n";
                 }
-
             } else {
                 usage(argv);
                 return 1;
