@@ -54,6 +54,15 @@
 #include <iostream>
 #include <fstream>
 
+int glob_n_vocab = 0;
+int glob_n_embed = 0;
+int glob_n_head = 0;
+int glob_n_head_kv = 0;
+int glob_n_ctx = 0;
+int glob_n_past = 0;
+int glob_n_tokens  = 1;
+
+
 static inline void fill_causal_mask_f16(
     ggml_tensor * KQ_mask,  // [n_kv, n_tokens, 1], type = F16
     int n_kv,
@@ -1341,7 +1350,6 @@ struct test_case {
     }
 
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
-        std::cout << "1" << "\n";
         
         mode = MODE_PERF;
 
@@ -1357,7 +1365,6 @@ struct test_case {
         };
         ggml_context_ptr ctx(ggml_init(params));
         GGML_ASSERT(ctx);
-        std::cout << "2" << "\n";
 
         // Minsung modified
         // Note: modified to get output tensor and bytes (to arithmetic intensity)
@@ -1369,7 +1376,6 @@ struct test_case {
         ggml_tensor * k = ggml_get_tensor(ctx.get(), "k");
         ggml_tensor * v = ggml_get_tensor(ctx.get(), "v");
         ggml_tensor * m = ggml_get_tensor(ctx.get(), "m");
-        std::cout << "3" << "\n";
 
         std::string   current_op_name = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1413,14 +1419,12 @@ struct test_case {
             return false;
         }
 
-        std::cout << "4" << "\n";
         // randomize tensors
         initialize_tensors(ctx.get());
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
-        std::cout << "5" << "\n";
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -1428,7 +1432,6 @@ struct test_case {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
         }
-        std::cout << "6" << "\n";
 
         // determine number of runs
         int n_runs;
@@ -4945,7 +4948,8 @@ struct test_llama : public test_llm {
 // Minsung Note:
 // Explicitly added for attention roofline test.
 struct test_attention : public test_llm {
-    static constexpr float freq_base  = 10000.0f;
+    // static constexpr float freq_base  = 10000.0f;
+    static constexpr float freq_base  = 500000; // For same test env with LLAMA3-8b-Q8
     static constexpr float freq_scale = 1.0f;
     static constexpr float ext_factor = 0.0f;
     static constexpr float attn_factor= 1.0f;
@@ -4991,6 +4995,8 @@ struct test_attention : public test_llm {
         int n_rot        = 100,
         int n_embd_head  = 100,
         int n_ff         = 8640,
+        int n_embd_head_override = -1,
+        int n_rot_override = -1,
         bool fused       = false
     )
     : test_llm({
@@ -5021,15 +5027,28 @@ struct test_attention : public test_llm {
 
         hp.n_kv    = n_kv_runtime;
         hp.kv_head = kv_head_rt;
+        // ★★★ 핵심: head_dim 설정
+        int computed_head = hp.n_embd / (int)hp.n_head;
+        if (n_embd_head_override > 0) {
+            hp.n_embd_head = n_embd_head_override;
+        } else {
+            hp.n_embd_head = computed_head;      // ← 자동 계산
+        }
 
-        fprintf(stderr, "[ctor] n_ctx=%d n_past=%d n_tokens=%d n_kv=%d kv_head=%d\n",
-                hp.n_ctx, hp.n_past, hp.n_tokens, hp.n_kv, hp.kv_head);
+        // RoPE dim도 모델에 맞추고 싶으면 여기서 맞춤 (Llama-3.2: 128)
+        if (n_rot_override > 0) {
+            hp.n_rot = (uint32_t)n_rot_override;
+        } else {
+            hp.n_rot = (uint32_t)hp.n_embd_head; // 보수적 기본: head_dim과 동일
+        }
 
-        GGML_ASSERT(hp.n_kv    >= 0);
-        GGML_ASSERT(hp.kv_head >= 0);
-        GGML_ASSERT(hp.n_kv    <= hp.n_ctx);
-        GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
+        // 정합성 assert
+        GGML_ASSERT(hp.n_embd % hp.n_head == 0);                  // Q reshape 조건
+        GGML_ASSERT(hp.n_embd_head * hp.n_head == hp.n_embd);
+        GGML_ASSERT((int)hp.n_embd_gqa() == (int)hp.n_embd_head * (int)hp.n_head_kv);
         GGML_ASSERT(hp.n_kv == hp.n_past + hp.n_tokens);
+        GGML_ASSERT(hp.n_kv <= hp.n_ctx);
+        GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
     }
     // 나머지 build_graph(), 기타 멤버는 기존(또는 이전에 드린 수정본) 그대로 사용
 
@@ -5039,7 +5058,6 @@ struct test_attention : public test_llm {
         // 가장 합리적 추론: n_tokens = n_kv - n_past  (prefill: n_kv=T, decode: 보통 1)
         hp.n_tokens = std::max(1, hp.n_kv - hp.n_past);
     }
-    std::cout << "A" << "\n";
 
     // 불변식 강제
     hp.n_kv    = hp.n_past + hp.n_tokens;
@@ -5055,7 +5073,6 @@ struct test_attention : public test_llm {
 
     struct ggml_tensor * cur;
     struct ggml_tensor * inpL;
-    std::cout << "b" << "\n";
 
     // [n_embd, n_tokens]
     inpL = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, hp.n_tokens);
@@ -5076,13 +5093,10 @@ struct test_attention : public test_llm {
 
     const int64_t kv_elems_all = n_layers * kv_heads * head_dim * n_ctx_max;
 
-    std::cout << "c" << "\n";
     ggml_tensor * k_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
     ggml_tensor * v_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
 
-    std::cout << "d" << "\n";
     for (uint32_t il = 0; il < hp.n_layer; ++il) {
-    std::cout << "e" << "\n";
         struct ggml_tensor * inpSA = inpL;
 
         // norm
@@ -5117,7 +5131,6 @@ struct test_attention : public test_llm {
 
             // 어텐션: n_kv 길이를 참조, 마스크는 이미 causal로 세팅됨
             cur = llm_build_kqv_modified(ctx, k_l, v_l, Qcur, KQ_mask, 1.0f/sqrtf(float(hp.n_embd_head)));
-            std::cout << "f" << "\n";
         }
 
         struct ggml_tensor * ffn_inp = ggml_add(ctx, cur, inpSA);
@@ -5139,10 +5152,8 @@ struct test_attention : public test_llm {
 
         // input for next layer
         inpL = cur;
-    std::cout << "g" << "\n";
     }
 
-    std::cout << "g2" << "\n";
 
     cur = inpL;
 
@@ -5152,7 +5163,6 @@ struct test_attention : public test_llm {
     // lm_head
     ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_vocab);
     cur = ggml_mul_mat(ctx, output, cur);
-    std::cout << "g3" << "\n";
 
     return cur;
 }
@@ -6268,15 +6278,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Minsung modified
     // Note: for attention test
-    test_cases.emplace_back(new test_attention(/*n_tokens=*/5,
-                 /*n_vocab=*/32000, /*n_embd=*/3200,
-                 /*n_head=*/32, /*n_head_kv=*/32,
-                 /*n_ctx=*/2048,   // 최대 컨텍스트
-                 /*n_past=*/0,
-                 /*n_kv_runtime=*/-1,  // 자동 → 0 + 512
-                 /*kv_head_rt=*/-1)  // 자동 → 0)
-    );
-
+    test_cases.emplace_back(new test_attention(
+        /*n_tokens=*/glob_n_tokens,
+        /*n_vocab=*/ (glob_n_vocab   ? glob_n_vocab   : 32000),
+        /*n_embd=*/  (glob_n_embed   ? glob_n_embed   : 3200),
+        /*n_head=*/  (glob_n_head    ? glob_n_head    : 32),
+        /*n_head_kv*/(glob_n_head_kv ? glob_n_head_kv : 32),
+        /*n_ctx=*/   (glob_n_ctx      ? glob_n_ctx      : 512),
+        /*n_past=*/   glob_n_past,
+        /*n_kv_runtime=*/-1,  // 자동: n_past + n_tokens
+        /*kv_head_rt=*/ -1    // 자동: n_past
+    ));
 
     return test_cases;
 }
@@ -6350,8 +6362,75 @@ static void usage(char ** argv) {
 
 int main(int argc, char ** argv) {
     // Minsung note
-    // How to use:
-    // ./test-backend-ops perf -o MUL_MAT -b CPU -t 3
+    // How to use (ATTENTION microbench):
+    /*
+    Basic form
+    ----------
+    ./binary_name perf -o ATTENTION <key=value ...> CPU [-t <threads>]
+
+    ATTENTION keys (key=value)
+    --------------------------
+    n_vocab    : vocab size (e.g., 128256)
+    n_embd     : hidden size / embedding dim (e.g., 3072)
+    n_head     : attention heads (e.g., 24)
+    n_head_kv  : KV heads for GQA (e.g., 8)
+    n_ctx      : max context length (cache capacity / slots)
+    n_past     : length already in KV cache (L)
+    n_tokens   : input tokens for this step (N)
+
+    Notes:
+        - n_kv (= L + N) and kv_head (= L) are computed automatically.
+        - Typical consistency: n_embd == n_head * n_embd_head (here n_embd_head=128).
+        - Memory for KV (per layer, per type) ~ n_head_kv * n_embd_head * n_ctx * sizeof(FP16).
+        - For "Llama-3.2-3B-Instruct" : n_vocab=128256, n_embd=3072, n_head=24, n_head_kv=8,
+        n_ctx (practical) 4096~8192, freq_base=500000, n_rot(rope dim)=128.
+
+    Prefill (encode many tokens at once)
+    ------------------------------------
+    Goal: build fresh KV for N tokens with causal mask.
+    Set:  n_past=0, n_tokens=N (e.g., 2048)
+    Example:
+        ./binary_name perf -o ATTENTION \
+        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 \
+        n_ctx=8192 n_past=0 n_tokens=2048 -b CPU
+
+    Decode (generate next token(s) given past L)
+    --------------------------------------------
+    Goal: attend to past L and add 1 new token into KV at position L.
+    Set:  n_past=L, n_tokens=1
+    Example (single step, L=2048):
+        ./binary_name perf -o ATTENTION \
+        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 \
+        n_ctx=8192 n_past=2048 n_tokens=1 -b CPU
+
+    Multi-step decode loop (concept)
+    --------------------------------
+    For k steps, increment n_past each step:
+        step 0: n_past=L,     n_tokens=1
+        step 1: n_past=L+1,   n_tokens=1
+        ...
+        step k: n_past=L+k,   n_tokens=1
+    (Each step appends 1 position to KV and attends to length L+step+1.)
+
+    Backend/threads examples
+    ------------------------
+    CUP backend, 6 threads:
+        ./binary_name perf -o ATTENTION ... -b CPU -t 6
+
+    Quick presets
+    -------------
+    Llama-3.2-3B-like prefill (practical context):
+        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=0 n_tokens=1024
+
+    Llama-3.2-3B-like decode from L=1024:
+        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=1024 n_tokens=1
+
+    Troubleshooting
+    ---------------
+    - If reshape/assert fails: verify n_embd == n_head * n_embd_head (128 here),
+        and that n_kv (=n_past + n_tokens) <= n_ctx.
+    - If OOM: reduce n_ctx or n_tokens (KV memory scales with n_ctx).
+    */
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
@@ -6374,6 +6453,63 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 op_names_filter = argv[++i];
+
+                // ★ ATTENTION일 때, 이어지는 key=value 들을 파싱
+                if (strcmp(op_names_filter, "ATTENTION") == 0) {
+                    auto parse_kv = [](const char * s, const char * key, int & out) -> bool {
+                        // key=number 형태만 수용
+                        size_t klen = strlen(key);
+                        if (strncmp(s, key, klen) == 0 && s[klen] == '=') {
+                            out = std::stoi(std::string(s + klen + 1));
+                            return true;
+                        }
+                        return false;
+                    };
+
+                    // 다음 옵션(-로 시작) 나오기 전까지 key=value 소비
+                    while (i + 1 < argc && argv[i + 1][0] != '-') {
+                        const char * tok = argv[++i];
+
+                        // 지원하는 키들:
+                        // n_vocab, n_embd, n_head, n_head_kv, n_ctx, n_past, n_tokens
+                        if (parse_kv(tok, "n_vocab",    glob_n_vocab))   continue;
+                        if (parse_kv(tok, "n_embd",     glob_n_embed))   continue;
+                        if (parse_kv(tok, "n_head",     glob_n_head))    continue;
+                        if (parse_kv(tok, "n_head_kv",  glob_n_head_kv)) continue;
+                        if (parse_kv(tok, "n_ctx",      glob_n_ctx))      continue;
+                        if (parse_kv(tok, "n_past",     glob_n_past))    continue;
+                        if (parse_kv(tok, "n_tokens",   glob_n_tokens))  continue;
+
+                        // 알 수 없는 토큰은 경고만
+                        std::cerr << "[ATTENTION] Unknown arg: " << tok
+                                << " (expected key=value such as n_ctx=2048)\n";
+                    }
+
+                    // 기본값/유효성 간단 체크 (필요하면 강화)
+                    if (glob_n_ctx <= 0) {
+                        std::cerr << "[ATTENTION] n_ctx not set; defaulting to 512\n";
+                        glob_n_ctx = 512;
+                    }
+                    if (glob_n_tokens <= 0) {
+                        std::cerr << "[ATTENTION] n_tokens not set; defaulting to 1\n";
+                        glob_n_tokens = 1;
+                    }
+                    if (glob_n_past < 0) {
+                        std::cerr << "[ATTENTION] n_past < 0 is invalid; clamping to 0\n";
+                        glob_n_past = 0;
+                    }
+
+                    // 참고 출력(선택)
+                    std::cout << "[ATTENTION] n_vocab="    << glob_n_vocab
+                            << " n_embd="                << glob_n_embed
+                            << " n_head="                << glob_n_head
+                            << " n_head_kv="             << glob_n_head_kv
+                            << " n_ctx="                 << glob_n_ctx
+                            << " n_past="                << glob_n_past
+                            << " n_tokens="              << glob_n_tokens
+                            << "\n";
+                }
+
             } else {
                 usage(argv);
                 return 1;
