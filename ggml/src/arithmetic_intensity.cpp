@@ -1,7 +1,6 @@
 #include "arithmetic_intensity.h"
 #include "ggml.h"
 #include "ggml-impl.h"   
-
 #include "freq_ai_policy.h"
 #include "ggml-dvfs.h"
 
@@ -10,6 +9,19 @@
 #include <array>
 #include <atomic>
 #include <csignal>
+#include <cstring> 
+#include "roofline_select.h"
+#include "perf_frame.h"
+#include "selector.h"
+#include "roofline_pred.h"
+#include "energy_model.h"
+
+// 전역 또는 static 설정(보정값은 보드에 맞춰 튠)
+static RooflineCaps g_caps{ 1.2e12, 30e9 };
+static EnergyModel  g_em{};
+static SelectorCfg  g_scfg{ 1.0 };        // 에너지 최적화
+static RLPolicyCfg  g_rlcfg{};
+static RLSystem     g_rlsys{ 1.0, 1.0, 1.0, 1.0 };
 
 // ==== EWMA 토글 & 파라미터 ================================================
 // 1: EWMA 사용, 0: 미사용(즉시값)
@@ -33,6 +45,12 @@ void ggml_analyze_arithmetic_intensity(const ggml_cgraph * graph);
 
 // maybe_probe_api: 외부 요청이 있을 때만 AI 계산 실행
 void maybe_probe_ai(const ggml_cgraph * graph);
+
+// null-safe strstr 래퍼 (프로토타입 또는 inline 정의)
+static inline bool has(const char* s, const char* pat);
+
+// 노드명 기반 그룹 추론 (프로토타입)
+static int infer_group_from_node(const ggml_tensor* dst);
 
 // Op별 통계 정보
 struct OpStats {
@@ -99,6 +117,8 @@ static void ensure_decider_initialized() {
 
     // RL 훅 사용 시 set_rl_hook(...) 등록
     g_decider.set_rl_hook(nullptr);
+    rl_configure(g_caps, g_rlcfg);
+    rl_set_system(g_rlsys);
 }
 
 // 외부에서 시스템/쿼리 스냅샷 갱신
@@ -153,14 +173,52 @@ void ggml_analyze_arithmetic_intensity(const ggml_cgraph * graph) {
         const double ai_for_policy = ai;   // 즉시값 사용
 #endif
 
-        OpContext oc{ .op_id = dst->op, .ai_ewma = ai_for_policy };
-        Decision d = g_decider.decide_and_schedule(oc);
-        // CPU / MEM 각각 action table 갱신
-        ggml_dvfs_set    (dst->op, d.cpu_khz);
-        ggml_memfreq_set (dst->op, d.mem_khz);
+        // 1) 그룹 판별
+        const int gid = infer_group_from_node(dst);
 
-        printf("node[%2d]: op=%-12s  FLOP=%12.0f  Bytes=%12.0f  AI=%6.2f\n",
-               i, ggml_op_name(dst->op), flops, bytes, ai);
+        // 2) 스킵 대상이면 DVFS 관련 호출을 건너뛰고 통계/로그만 계속
+        if (gid == GGML_DVFS_GRP_SKIP) {
+            // (원하면 여기서도 printf는 계속)
+            printf("[skip dvfs] node[%2d] name=\"%s\" op=%d  AI=%.2f\n",
+                i, dst->name ? dst->name : "(null)", dst->op, ai);
+            total_flops += flops;
+            total_bytes += bytes;
+            continue; // DVFS는 스킵
+        }
+
+        // 3) 정책 호출 (★gid를 op_id 대신 넘겨 같은 그룹=같은 의사결정)
+        PerfFrame f{};
+        f.group = (ggml_group)gid;
+        f.flops = flops;
+        f.bytes = bytes;
+        f.ai    = (bytes > 0.0) ? (flops / bytes) : 0.0;
+
+        // (원하면 컨텍스트 메타 채우기: 레이어/토큰 등)
+        // f.layer = /* layer index if known */;
+        // f.token_id = /* decode step */;
+        // f.stage = Stage::DECODE; // or PREFILL
+
+        // 4-1) 이번 스텝용 후보를 Roofline 규칙으로 생성
+        FreqCandidates cand{};
+        rl_build_candidates(f, g_caps, g_rlcfg, cand);
+
+        // 4-2) 그 후보만 평가하여 최적 조합 선택
+        Decision d = select_with_energy(f, g_caps, g_em, g_scfg, cand);
+
+
+        // (선택) 예측치 디버깅
+        f.t_pred_ms = predict_latency_ms(f, d.cpu_khz, d.mem_khz, g_caps);
+        f.e_pred_j  = predict_power_w(g_em, f.group, d.cpu_khz, d.mem_khz, f.ai) * (f.t_pred_ms / 1e3);
+
+        // ── 목표 기록 + 즉시 적용 ─────────────────────────────────────
+        ggml_dvfs_set    (gid, d.cpu_khz);
+        ggml_memfreq_set (gid, d.mem_khz);
+        ggml_dvfs_apply_if_needed(gid);   // ← 바로 sysfs 반영(값이 바뀐 경우만)
+
+        // 로깅
+        printf("[dvfs gid=%d] node[%2d] name=\"%s\" cpu=%d kHz mem=%d kHz  AI=%.2f  t_pred=%.2fms  e_pred=%.3fJ\n",
+            gid, i, dst->name ? dst->name : "(null)",
+            d.cpu_khz, d.mem_khz, f.ai, f.t_pred_ms, f.e_pred_j);
 
         total_flops  += flops;
         total_bytes  += bytes;
@@ -183,4 +241,41 @@ void maybe_probe_ai(const ggml_cgraph * graph) {
 
 void setup_probe_signal() {
     std::signal(SIGUSR1, [](int){ probe_requested.store(true); });
+}
+
+// null-safe strstr 래퍼
+static inline bool has(const char* s, const char* pat) {
+    return s && std::strstr(s, pat);
+}
+
+// node name 기반으로 DVFS 그룹 추론
+static int infer_group_from_node(const ggml_tensor* dst) {
+    const char* nm = dst->name ? dst->name : "";
+
+    // ---- Attention 계열 ----
+    // Q/K/V, reshape/permute/transpose 포함, KV cache view/copy/permuted 포함
+    if (has(nm, "Qcur") || has(nm, "Kcur") || has(nm, "Vcur") ||
+        has(nm, "kqv_out") || has(nm, "attn_out") ||
+        has(nm, "cache_k_") || has(nm, "cache_v_") ||           // cache_k_l4, cache_v_l4...
+        has(nm, "(reshaped)") || has(nm, "(permuted)") || has(nm, "(transposed)")) {
+        return GGML_DVFS_GRP_ATTN;
+    }
+
+    // ---- FFN 계열 ----
+    // gate/up/down proj, swiglu 등
+    if (has(nm, "ffn_") || has(nm, "swiglu") ||
+        has(nm, "ffn_up") || has(nm, "ffn_down") || has(nm, "ffn_gate")) {
+        return GGML_DVFS_GRP_FFN;
+    }
+
+    // ---- Norm 계열 ----
+    if (has(nm, "norm-") || has(nm, "attn_norm") || has(nm, "ffn_norm")) {
+        return GGML_DVFS_GRP_NORM;
+    }
+
+    // (원하면 임베딩/입출력 등도 추가)
+    // if (has(nm, "embed")) return GGML_DVFS_GRP_EMB;
+
+    // 나머지
+    return GGML_DVFS_GRP_MISC;
 }

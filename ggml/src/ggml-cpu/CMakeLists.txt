@@ -589,29 +589,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
-    # --- Arm Streamline annotate: ggml-cpu만 계측 ---
-    # 환경변수 STREAMLINE_ANNOTATE_DIR가 있으면 우선 사용, 없으면 macOS 기본 설치 경로 사용
-    if (DEFINED ENV{STREAMLINE_ANNOTATE_DIR})
-        set(SL_ANN_DIR $ENV{STREAMLINE_ANNOTATE_DIR})
-    else()
-        set(SL_ANN_DIR "/Applications/Arm_Performance_Studio_2025.4/streamline/gator/annotate")
-    endif()
-
-    # 헤더/소스가 있으면 ggml-cpu 타겟에만 포함
-    if (EXISTS "${SL_ANN_DIR}/streamline_annotate.h" AND EXISTS "${SL_ANN_DIR}/streamline_annotate.c")
-        message(STATUS "Arm Streamline annotate enabled for ${GGML_CPU_NAME}: ${SL_ANN_DIR}")
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE USE_ARM_STREAMLINE)
-        target_include_directories(${GGML_CPU_NAME} PRIVATE ${SL_ANN_DIR})
-        target_sources(${GGML_CPU_NAME} PRIVATE ${SL_ANN_DIR}/streamline_annotate.c)
-
-        # Android에서는 log 심볼 필요
-        if (CMAKE_SYSTEM_NAME MATCHES "Android")
-            target_link_libraries(${GGML_CPU_NAME} PRIVATE log)
-        endif()
-    else()
-        message(STATUS "Arm Streamline annotate not found: ${SL_ANN_DIR} (skipping)")
-    endif()
-    # --- /Arm Streamline annotate ---
 
     if (EMSCRIPTEN)
         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")

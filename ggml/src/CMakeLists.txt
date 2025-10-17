@@ -209,7 +209,9 @@ add_library(ggml-base STATIC
             ggml-quants.h
             gguf.cpp
             arithmetic_intensity.cpp
-            freq_ai_policy.cpp)
+            freq_ai_policy.cpp
+            roofline_select.cpp
+            )
 
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_BACKEND_DL)
