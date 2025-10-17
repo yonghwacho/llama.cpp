@@ -2841,40 +2841,49 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata     =*/ cplan->work_data,
         /*.threadpool=*/ tp,
     };
-
-    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+    // Minsung Note:
+    // OP running part
+    for (int node_n = 0; node_n < cgraph->n_nodes &&
+                         atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (state->ith == 0) {
-            ggml_dvfs_apply_if_needed(node->op);   // sysfs write 1 회 or no‑op
+            ggml_dvfs_apply_if_needed(node->op);   // sysfs write 1회 or no-op
         }
-        //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
-        
+
+        // --- 타이밍 시작(스레드 0) ---
+        // uint64_t t0_us = 0;
+        // if (state->ith == 0) {
+        //     t0_us = ggml_time_us();
+        // }
+
+        // 실제 연산
         ggml_compute_forward(&params, node);
 
+        // abort 콜백 체크 (원래 위치 유지)
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
-            /*
-            if (state->ith == 0) {
-                int cur_op = cgraph->nodes[node_n]->op;
-                //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
-                //printf("[debug] next_op=%d\n", next_op);
-            }
-            */
-            ggml_barrier(state->threadpool);
-        }
-        //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
+        // --- 모든 스레드가 이 노드를 끝낼 때까지 동기화 ---
+        ggml_barrier(state->threadpool);
+
+        // --- 타이밍 종료 및 출력(스레드 0) ---
+        // if (state->ith == 0) {
+        //     const uint64_t t1_us = ggml_time_us();
+        //     const double ms = (double)(t1_us - t0_us) / 1000.0;
+        //     // 소수점 4자리
+        //     printf("[time]  node %4d: name=\"%s\", op=%d %.4f ms\n",
+        //            node_n, node->name ? node->name : "(null)", node->op, ms);
+        // }
     }
 
     ggml_barrier(state->threadpool);
-
     return 0;
 }
+
 
 #ifndef GGML_USE_OPENMP
 

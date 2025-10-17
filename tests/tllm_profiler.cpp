@@ -9,22 +9,10 @@
 // Quick start for adding a new GGML op: Go to section 2 and create a struct that inherits from test_case,
 // then go to section 3 and add an instantiation of your struct.
 
-
-// ##############################
-// ## Section 1: General Setup ##
-// ##############################
-
-
 /*
   SNU@NXC
   Minsung Note: 
-  Modified version of test-backend-ops.cpp for tllm.
-  Todo:
-    1. Clean unused codes.
-    2. Get realistic parameters of Attentions.
-    3. Add calculation for AI(arithmatic intensity) of attention.
-    4. Parameterize Attention inputs.
-    5. Automate.
+  Modified version of test-backend-ops.cpp for tllm roofline analysis.
 */
 
 
@@ -53,98 +41,187 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
+#include <unordered_set>
 
-int glob_n_vocab = 0;
-int glob_n_embed = 0;
-int glob_n_head = 0;
-int glob_n_head_kv = 0;
-int glob_n_ctx = 0;
+int glob_n_vocab = 128256;
+int glob_n_embed = 3072;
+int glob_n_head = 24;
+int glob_n_head_kv = 8;
+int glob_n_ctx = 8192;
 int glob_n_past = 0;
 int glob_n_tokens  = 1;
 int glob_n_ff = 0; 
-int glob_subgraph = 0; // 0=attn, 1=ffn, 2=both
+int glob_subgraph = 0; 
 
+struct AttnCost {
+    double flops;  // per-run FLOPs
+    double bytes;  // per-run Bytes (rough)
+};
 
-
-// ---- FLOPs / Bytes for Attention & FFN ----
-//  - FLOPs: matmul 1 MAC = 2 FLOPs 가정
-//  - Bytes: 논리적 추정(가중치/활성), FP32 4B 기준 단순 상한 (정확 트래픽 요구 시 ggml_nbytes 합산으로 확장 가능)
-
-static inline double flops_attention_formula(
-    int n_embd, int n_head, int n_head_kv, int n_embd_head,
-    int n_tokens, int n_kv,
-    bool include_qkv_proj = true, bool include_wo = true, bool include_softmax = true) {
-
-    const double E   = n_embd;
-    const double H   = n_head;
-    const double HKV = n_head_kv;
-    const double D   = n_embd_head;          // 보통 E/H
-    const double N   = n_tokens;             // query 길이
-    const double L   = n_kv;                 // key 길이 (past + cur)
-    const double Ekv = D * HKV;
-
-    double flops = 0.0;
-    if (include_qkv_proj) {
-        flops += 2.0 * E * E   * N;   // Wq * X
-        flops += 2.0 * E * Ekv * N;   // Wk * X
-        flops += 2.0 * E * Ekv * N;   // Wv * X
+static inline int bpp_ggml_type(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32: return 4;
+        case GGML_TYPE_F16: return 2;
+        case GGML_TYPE_Q8_0: return 1;   // 간단화(스케일/제로포인트 등은 무시)
+        default: return 4;
     }
-    flops += 2.0 * H * N * L * D;     // QK^T
-    if (include_softmax) flops += 5.0 * H * N * L; // exp+sum+div 근사
-    flops += 2.0 * H * N * L * D;     // (softmax)*V
-    if (include_wo) flops += 2.0 * E * E * N; // Wo
-    return flops;
 }
 
-static inline double bytes_attention_logical(
-    int n_embd, int n_head, int n_head_kv, int n_embd_head,
-    int n_tokens, int n_kv, bool prefill,
-    bool include_qkv_proj = true, bool include_wo = true) {
+// Minsung note: estimates attention cost (FLOPS, Bytes, w/o softmax)
+static inline AttnCost estimate_attention_cost_closed_form_runtime(
+    int E,        // n_embd
+    int H,        // n_head
+    int Hkv,      // n_head_kv
+    int N,        // n_tokens (현재 run에서 처리하는 새 토큰 수)
+    int L,        // 참조 KV 길이 = n_past + N (prefill이면 L=N, decode면 보통 L≈n_past+1)
+    ggml_type wtype,     // 가중치 dtype (예: GGML_TYPE_Q8_0)
+    ggml_type act_type,  // activation dtype (예: GGML_TYPE_F32)
+    ggml_type kv_type    // KV 캐시 dtype (예: GGML_TYPE_F16)
+) {
+    // ===== 내부 토글 =====
+    // 가중치 메모리 읽기를 Bytes에 포함할지 (기본: 포함)
+    static constexpr bool INCLUDE_WEIGHT_BYTES      = true;
+    // 어텐션에서 K/V를 길이 L만큼 "스트리밍 read"한다고 보고 Bytes에 넣을지 (기본: 미포함)
+    //   - 커널/캐시 정책에 따라 편차가 커서 기본은 최소 근사(미포함)로 둡니다.
+    static constexpr bool INCLUDE_KV_STREAM_READS   = false;
 
-    const double E   = n_embd;
-    const double HKV = n_head_kv;
-    const double D   = n_embd_head;
-    const double N   = n_tokens;
-    const double L   = n_kv;
-    const double Ekv = D * HKV;
-
-    double bytes_elem = 0.0;
-    if (include_qkv_proj) {
-        bytes_elem += (E*E);     // Wq
-        bytes_elem += (E*Ekv);   // Wk
-        bytes_elem += (E*Ekv);   // Wv
-    }
-    if (include_wo) {
-        bytes_elem += (E*E);     // Wo
+    // 방어
+    if (E <= 0 || H <= 0 || Hkv <= 0 || N <= 0 || L <= 0) {
+        return {0.0, 0.0};
     }
 
-    // activations (아주 단순 상한):
-    bytes_elem += (E*N);         // X
-    bytes_elem += (E*N);         // Q
-    bytes_elem += (Ekv*N);       // K 생성분량(프리필은 N, 디코드는 1이지만 간단화)
-    bytes_elem += (Ekv*N);       // V 생성분량
-    bytes_elem += (N*L);         // attn
+    // D(head dim) 정합성: E % H == 0 권장
+    // 정수 나눗셈이 아니어도 스케일은 유지되지만, 모델 파라미터가 잘못된 것일 수 있음
+    const bool div_ok = (E % H == 0);
+    const double dE  = (double) E;
+    const double dH  = (double) H;
+    const double dHk = (double) Hkv;
+    const double dD  = div_ok ? (double)(E / H) : (dE / dH); // 안전하게 처리
+    const double dN  = (double) N;
+    const double dL  = (double) L;
 
-    return bytes_elem * 4.0;     // FP32 상한 (양자화/실제 타입 반영하려면 ggml_nbytes로 대체)
+    // ───────────── FLOPs (softmax 제외) ─────────────
+    // 행렬곱 FLOPs 규약: 2 * M * N * K (MAC = 2 FLOPs)
+    // 1) Q 투영: Wq[E,E] * X[E,N] -> [E,N]
+    const double fl_q   = 2.0 * dE * dE * dN;
+
+    // 2) K,V 투영: Wk/Wv[E,D*Hk] * X[E,N] -> [D*Hk,N] (2회)
+    const double fl_kv  = 2.0 * 2.0 * dE * (dD * dHk) * dN;
+
+    // 3) QK^T: [H,N,D] x [H,L,D] -> [H,N,L]
+    const double fl_qkt = 2.0 * dH * dN * dL * dD;
+
+    // 4) A·V: [H,N,L] x [H,L,D] -> [H,N,D]
+    const double fl_av  = 2.0 * dH * dN * dL * dD;
+
+    // 5) Wo 투영: Wo[E,E] * out[E,N] -> [E,N]
+    const double fl_wo  = 2.0 * dE * dE * dN;
+
+    // softmax FLOPs는 제외
+    const double flops_total = fl_q + fl_kv + fl_qkt + fl_av + fl_wo;
+
+    // ───────────── Bytes (softmax 자료구조 제외) ─────────────
+    const int bW  = bpp_ggml_type(wtype);
+    const int bA  = bpp_ggml_type(act_type);
+    const int bKV = bpp_ggml_type(kv_type);
+
+    // (선택) 가중치 한 번 읽기
+    const double bytes_wq = dE * dE            * bW;
+    const double bytes_wk = dE * (dD * dHk)    * bW;
+    const double bytes_wv = dE * (dD * dHk)    * bW;
+    const double bytes_wo = dE * dE            * bW;
+    const double weight_bytes = (INCLUDE_WEIGHT_BYTES ? (bytes_wq + bytes_wk + bytes_wv + bytes_wo) : 0.0);
+
+    // 활성 (최소 근사: 각 텐서를 1-pass로 다룬다고 가정)
+    const double bytes_X    = dE * dN          * bA;           // 입력 X read
+    const double bytes_Q    = (dH  * dD) * dN  * bA;           // Q
+    const double bytes_K    = (dHk * dD) * dN  * bA;           // K (proj 결과)
+    const double bytes_V    = (dHk * dD) * dN  * bA;           // V (proj 결과)
+    const double bytes_out  = dE * dN          * bA;           // 최종 출력 write
+
+    // softmax(score/prob) materialize 비용 전부 제외
+    // const double bytes_attn = (dH * dN * dL) * bA; // 제외
+    const double bytes_attn = 0.0;
+
+    // KV cache write: 이번 run에서 K/V 새 토큰 N개 저장
+    const double bytes_write_K = (dHk * dD) * dN * bKV;
+    const double bytes_write_V = (dHk * dD) * dN * bKV;
+
+    // (선택) KV 스트리밍 read 포함: 토큰 N개 * 길이 L을 Hkv*D 채널로 읽는 근사
+    //   - 커널/캐시/타일링에 따라 오차 큼. 기본은 제외.
+    const double bytes_read_K_stream = (INCLUDE_KV_STREAM_READS ? (dHk * dD) * dL * dN * bKV : 0.0);
+    const double bytes_read_V_stream = (INCLUDE_KV_STREAM_READS ? (dHk * dD) * dL * dN * bKV : 0.0);
+
+    const double bytes_total =
+        weight_bytes +
+        (bytes_X + bytes_Q + bytes_K + bytes_V + bytes_attn + bytes_out) +
+        (bytes_write_K + bytes_write_V) +
+        (bytes_read_K_stream + bytes_read_V_stream);
+// fprintf(stderr,
+//   "[attn-cost] N=%d L=%d :: FLOPs{WqX=%.3e, WkV=%.3e, QKt=%.3e, AV=%.3e, Wo=%.3e} sum=%.3e\n",
+//   N, L, fl_q, fl_kv, fl_qkt, fl_av, fl_wo, flops_total);
+
+// fprintf(stderr,
+//   "[attn-cost] bytes breakdown (MB): W=%.2f, X=%.2f, Q=%.2f, Kp=%.2f, Vp=%.2f, out=%.2f, KVw=%.2f, KVread=%.2f, attn=%.2f  total=%.2f\n",
+//   weight_bytes/1e6,
+//   bytes_X/1e6, bytes_Q/1e6, bytes_K/1e6, bytes_V/1e6, bytes_out/1e6,
+//   (bytes_write_K+bytes_write_V)/1e6,
+//   (bytes_read_K_stream+bytes_read_V_stream)/1e6,
+//   bytes_attn/1e6,
+//   bytes_total/1e6);
+
+    return { flops_total, bytes_total };
 }
 
-static inline double flops_ffn_formula(int n_embd, int n_ff, int n_tokens) {
-    const double E = n_embd, F = n_ff, N = n_tokens;
-    double flops = 0.0;
-    flops += 2.0 * E * F * N; // up
-    flops += 2.0 * E * F * N; // gate
-    flops += 9.0 * F * N;     // silu + mul 근사
-    flops += 2.0 * F * E * N; // down
-    return flops;
+struct FFNCost {
+    double flops;
+    double bytes;
+};
+
+// Minsung note: estimates FFN cost (FLOPS, Bytes)
+static inline FFNCost estimate_ffn_cost_closed_form_runtime(
+    int E,              // n_embd
+    int F,              // n_ff (expand size)
+    int N,              // n_tokens
+    ggml_type wtype,    // weight dtype (e.g. GGML_TYPE_Q8_0)
+    ggml_type act_type  // activation dtype (e.g. GGML_TYPE_F32)
+) {
+    if (E <= 0 || F <= 0 || N <= 0) return {0.0, 0.0};
+
+    const double dE = (double) E;
+    const double dF = (double) F;
+    const double dN = (double) N;
+
+    // FLOPs (행렬곱은 2*M*N*K 규약, SiLU/elemwise는 근사)
+    const double fl_up     = 2.0 * dF * dN * dE;  // w_up[E,F] * X[E,N] -> [F,N]
+    const double fl_gate   = 2.0 * dF * dN * dE;  // w_gate[E,F] * X[E,N] -> [F,N]
+    const double fl_silu   = 4.0 * dF * dN;       // 근사 (원하면 0으로 둬도 무방)
+    const double fl_fused  = 1.0 * dF * dN;       // elementwise mul
+    const double fl_down   = 2.0 * dE * dN * dF;  // w_down[F,E] * fused[F,N] -> [E,N]
+
+    const double flops_total = fl_up + fl_gate + fl_silu + fl_fused + fl_down;
+
+    // Bytes (최소 근사: 각 텐서를 1-pass로 다룬다고 가정)
+    const int bW = bpp_ggml_type(wtype);
+    const int bA = bpp_ggml_type(act_type);
+
+    const double bytes_w_up   = dE * dF * bW;
+    const double bytes_w_gate = dE * dF * bW;
+    const double bytes_w_down = dF * dE * bW;
+
+    const double bytes_X      = dE * dN * bA;   // read
+    const double bytes_up     = dF * dN * bA;   // matmul output
+    const double bytes_gate   = dF * dN * bA;   // matmul output
+    const double bytes_fused  = dF * dN * bA;   // mul output
+    const double bytes_out    = dE * dN * bA;   // final write
+
+    const double bytes_total =
+        (bytes_w_up + bytes_w_gate + bytes_w_down) +
+        (bytes_X + bytes_up + bytes_gate + bytes_fused + bytes_out);
+
+    return { flops_total, bytes_total };
 }
 
-static inline double bytes_ffn_logical(int n_embd, int n_ff, int n_tokens) {
-    const double E = n_embd, F = n_ff, N = n_tokens;
-    double bytes_elem = 0.0;
-    bytes_elem += (E*F) + (E*F) + (F*E); // weights up/gate/down
-    bytes_elem += (E*N) + (F*N)*3 + (E*N); // activations rough
-    return bytes_elem * 4.0;
-}
 
 static inline void fill_causal_mask_f16(
     ggml_tensor * KQ_mask,  // [n_kv, n_tokens, 1], type = F16
@@ -499,6 +576,8 @@ static bool output_format_from_str(const std::string & s, output_formats & forma
 
 // Test result structure for SQL output
 struct test_result {
+    double per_run_flops = 0.0;   // Minsung
+    double per_run_bytes = 0.0;   // Minsung
     std::string test_time;
     std::string build_commit;
     std::string backend_name;
@@ -956,6 +1035,55 @@ struct console_printer : public printer {
         }
     }
 
+    // Minsung note: Outdated
+    // void print_perf_console(const test_result & result) {
+    //     if(!print_initial_data){
+    //         print_initial_data = true;
+    //         printf("Threads %d ", threads);
+    //         printf("BIG_CORE_FREQ %d ", BIG_freq);
+    //         printf("MID_CORE_FREQ %d ", MID_freq);
+    //         printf("MEM_FREQ %d\n", MEM_freq);
+    //     }
+    //     int len = printf("  %s(%s): ", result.op_name.c_str(), result.op_params.c_str());
+    //     fflush(stdout);
+
+    //     if (!result.supported) {
+    //         printf("not supported\n");
+    //         return;
+    //     }
+    //     // align while also leaving some margin for variations in parameters
+    //     int align = 8;
+    //     int last  = (len + align - 1) / align * align;
+    //     if (last - len < 5) {
+    //         last += align;
+    //     }
+    //     printf("%*s", last - len, "");
+
+    //     printf("    %8d runs - %8.2f us/run - ", result.n_runs, result.time_us);
+
+    //     if (result.per_run_flops > 0) {
+    //         auto format_flops = [](double flops) -> std::string {
+    //             char buf[256];
+    //             if (flops >= 1e12) {
+    //                 snprintf(buf, sizeof(buf), "%6.2f TFLOP", flops / 1e12);
+    //             } else if (flops >= 1e9) {
+    //                 snprintf(buf, sizeof(buf), "%6.2f GFLOP", flops / 1e9);
+    //             } else if (flops >= 1e6) {
+    //                 snprintf(buf, sizeof(buf), "%6.2f MFLOP", flops / 1e6);
+    //             } else {
+    //                 snprintf(buf, sizeof(buf), "%6.2f kFLOP", flops / 1e3);
+    //             }
+    //             return buf;
+    //         };
+    //         uint64_t op_flops_per_run = result.per_run_flops * result.time_us / 1e6;
+    //         printf("%s/run - %sS %f AI", format_flops(op_flops_per_run).c_str(),
+    //                format_flops(result.flops).c_str(), result.AI);
+    //     } else {
+    //         printf("%8zu kB/run - \033[1;34m%7.2f GB/s\033[0m", result.memory_kb, result.bandwidth_gb_s);
+    //     }
+    //     printf("\n");
+    // }
+
     void print_perf_console(const test_result & result) {
         if(!print_initial_data){
             print_initial_data = true;
@@ -971,38 +1099,51 @@ struct console_printer : public printer {
             printf("not supported\n");
             return;
         }
+
         // align while also leaving some margin for variations in parameters
         int align = 8;
         int last  = (len + align - 1) / align * align;
-        if (last - len < 5) {
-            last += align;
-        }
+        if (last - len < 5) last += align;
         printf("%*s", last - len, "");
 
-        printf("    %8d runs - %8.2f us/run - ", result.n_runs, result.time_us);
+        printf("%8d runs - %8.2f us/run - ", result.n_runs, result.time_us);
 
-        if (result.flops > 0) {
-            auto format_flops = [](double flops) -> std::string {
-                char buf[256];
-                if (flops >= 1e12) {
-                    snprintf(buf, sizeof(buf), "%6.2f TFLOP", flops / 1e12);
-                } else if (flops >= 1e9) {
-                    snprintf(buf, sizeof(buf), "%6.2f GFLOP", flops / 1e9);
-                } else if (flops >= 1e6) {
-                    snprintf(buf, sizeof(buf), "%6.2f MFLOP", flops / 1e6);
-                } else {
-                    snprintf(buf, sizeof(buf), "%6.2f kFLOP", flops / 1e3);
-                }
-                return buf;
-            };
-            uint64_t op_flops_per_run = result.flops * result.time_us / 1e6;
-            printf("%s/run - %sS %f AI", format_flops(op_flops_per_run).c_str(),
-                   format_flops(result.flops).c_str(), result.AI);
+        auto format_flops = [](double flops) -> std::string {
+            char buf[64];
+            if (flops >= 1e12)      snprintf(buf, sizeof(buf), "%6.2f TFLOP", flops / 1e12);
+            else if (flops >= 1e9)  snprintf(buf, sizeof(buf), "%6.2f GFLOP", flops / 1e9);
+            else if (flops >= 1e6)  snprintf(buf, sizeof(buf), "%6.2f MFLOP", flops / 1e6);
+            else                    snprintf(buf, sizeof(buf), "%6.2f kFLOP", flops / 1e3);
+            return buf;
+        };
+        auto format_bytes = [](double bytes) -> std::string {
+            char buf[64];
+            if (bytes >= (1ull<<40)) snprintf(buf, sizeof(buf), "%6.2f TB",  bytes / (double)(1ull<<40));
+            else if (bytes >= (1ull<<30)) snprintf(buf, sizeof(buf), "%6.2f GB",  bytes / (double)(1ull<<30));
+            else if (bytes >= (1ull<<20)) snprintf(buf, sizeof(buf), "%6.2f MB",  bytes / (double)(1ull<<20));
+            else if (bytes >= (1ull<<10)) snprintf(buf, sizeof(buf), "%6.2f kB",  bytes / (double)(1ull<<10));
+            else snprintf(buf, sizeof(buf), "%6.0f  B", bytes);
+            return buf;
+        };
+        // Minsung Note:
+        // Prints results (GFLOPS, AI)
+        if (result.per_run_flops > 0.0) { 
+            std::string per_run = format_flops(result.per_run_flops);
+            printf("%s/run - \033[1;32m%7.2f GFLOPS\033[0m", per_run.c_str(), result.flops);
+
+            if (result.per_run_bytes > 0.0) {
+                std::string per_bytes = format_bytes(result.per_run_bytes);
+                printf(" - %s/run", per_bytes.c_str());
+            }
+
+            // AI (FLOPs/Byte)
+            printf(" \033[1;36m%.6f AI\033[0m", result.AI);
         } else {
             printf("%8zu kB/run - \033[1;34m%7.2f GB/s\033[0m", result.memory_kb, result.bandwidth_gb_s);
         }
         printf("\n");
     }
+
 
     void print_support_console(const test_result & result) {
         printf("  %s(%s): ", result.op_name.c_str(), result.op_params.c_str());
@@ -1431,19 +1572,25 @@ struct test_case {
 
         return test_passed;
     }
-
+    // Misnung Note:
+    // Performance evaluation code body
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
-
         mode = MODE_PERF;
-        static const size_t graph_nodes = 8192;
-        const size_t MEM_POOL = 512ull * 1024 * 1024 * 8;
 
-        ggml_init_params params = { MEM_POOL, nullptr, true };
+        static const size_t graph_nodes = 8192;
+        const size_t MEM_POOL = 512ull * 1024 * 1024 * 8; // Usable memory amount (roughly 8GB now.)
+
+        ggml_init_params params = {
+            /* .mem_size = */ MEM_POOL,
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
         ggml_context_ptr ctx(ggml_init(params));
         GGML_ASSERT(ctx);
 
         ggml_tensor * out = build_graph(ctx.get());
 
+        // 이름으로 잡는 텐서들(없으면 nullptr일 수 있음)
         ggml_tensor * a = ggml_get_tensor(ctx.get(), "a");
         ggml_tensor * b = ggml_get_tensor(ctx.get(), "b");
         ggml_tensor * q = ggml_get_tensor(ctx.get(), "q");
@@ -1452,181 +1599,288 @@ struct test_case {
         ggml_tensor * m = ggml_get_tensor(ctx.get(), "m");
 
         std::string current_op_name = op_desc(out);
-        if (!matches_filter(out, op_names_filter)) return true;
+        if (!matches_filter(out, op_names_filter)) {
+            return true;
+        }
 
         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
         GGML_ASSERT(buf != nullptr);
 
+        // pos/mask 
         ggml_tensor * pos  = ggml_get_tensor(ctx.get(), "pos");
         ggml_tensor * mask = ggml_get_tensor(ctx.get(), "mask");
         GGML_ASSERT(pos && mask);
 
         const int n_tokens = (int) pos->ne[0];
         const int n_kv     = (int) mask->ne[0];
-        int n_past         = n_kv - n_tokens; if (n_past < 0) n_past = 0;
+        int n_past         = n_kv - n_tokens;
+        if (n_past < 0) n_past = 0;
 
-        // pos/mask 채우기
         fill_positions_i32(pos,  n_tokens, n_past);
         fill_causal_mask_f16(mask, n_kv, n_tokens, n_past);
 
-        if (buf == NULL) { printf("failed to allocate tensors\n"); return false; }
-
-        initialize_tensors(ctx.get());
-
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
-        ggml_build_forward_expand(gf, out);
-
-        // warmup
-        ggml_status status = ggml_backend_graph_compute(backend, gf);
-        if (status != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+        if (buf == NULL) {
+            printf("failed to allocate tensors\n");
             return false;
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // ★★★ ATTENTION/FFN용 FLOPs & Bytes (한 run 기준) 계산
-        //     전역 파라미터 사용 (이미 -o ATTENTION 파서로 채워짐)
-        //     n_embd_head는 기본적으로 E/H로 산출
-        // ─────────────────────────────────────────────────────────────
-        const int   E   = (glob_n_embed   > 0 ? glob_n_embed   : 3072);
-        const int   H   = (glob_n_head    > 0 ? glob_n_head    : 24);
-        const int   HKV = (glob_n_head_kv > 0 ? glob_n_head_kv : H);
-        const int   D   = E / H;                        // head_dim
-        const int   N   = n_tokens;                     // query len
-        const int   L   = n_kv;                         // key len = past+cur
-        const bool  is_prefill = (n_past == 0);
-        const int   F   = (glob_n_ff > 0 ? glob_n_ff : (4 * E)); // FFN 차원 추정(미지정 시 4*E)
+        // initialize tensors with random value 
+        initialize_tensors(ctx.get());
 
-        double model_flops_per_run = 0.0;
-        double bytes_per_run       = 0.0;
+        // graph build
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        ggml_build_forward_expand(gf, out);
 
-        // ─────────────────────────────────────────────────────────────
-        // ★★★ 어떤 서브그래프인지에 따라 공식 적용
-        //     (op_desc(out)가 "ATTENTION" 또는 "FFN"을 내도록 test_attention/test_ffn에서 설정)
-        // ─────────────────────────────────────────────────────────────
-        bool is_attention_subgraph = (current_op_name == "ATTENTION");
-        bool is_ffn_subgraph       = (current_op_name == "FFN");
+        // wamr-up run
+        ggml_status status = ggml_backend_graph_compute(backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n",
+                    __func__, ggml_status_to_string(status));
+            return false;
+        }
+        bool   is_cpu         = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
 
-        if (is_attention_subgraph) {
-            model_flops_per_run = flops_attention_formula(E, H, HKV, D, N, L, true, true, true);
-            bytes_per_run       = bytes_attention_logical(E, H, HKV, D, N, L, is_prefill, true, true);
-        } else if (is_ffn_subgraph) {
-            model_flops_per_run = flops_ffn_formula(E, F, N);
-            bytes_per_run       = bytes_ffn_logical(E, F, N);
+        // per-run 측정치(그래프 기반)
+        double flops_per_run  = 0;
+        double bytes_per_run  = 0;
+        // 런타임에서 확정 가능한 값들
+        const int N   = (int) pos->ne[0];      // [n_tokens]
+        const int L   = (int) mask->ne[0];     // [n_kv] = n_past + n_tokens
+
+        // 전역 파라미터 (파서에서 채워둔 값 사용)
+        const int E   = (glob_n_embed   > 0 ? glob_n_embed   : 3200);
+        const int H   = (glob_n_head    > 0 ? glob_n_head    : 32);
+        const int Hkv = (glob_n_head_kv > 0 ? glob_n_head_kv : 32);
+
+        ggml_tensor * X    = ggml_get_tensor(ctx.get(), "X");     // activations dtype 참고
+        ggml_type act_ty   = X ? X->type : GGML_TYPE_F32;
+
+        // Minsung Note:
+        // Calculates FLOPS and AI(arithmatic intensity) for each test cases.
+        // ATTENTION / FFN / ATTN_FFN
+        if (current_op_name == "ATTENTION") {
+            AttnCost a = estimate_attention_cost_closed_form_runtime(
+                E, H, Hkv, N, L,
+                GGML_TYPE_Q8_0,   // wq/wk/wv/wo (그래프에서 Q8_0로 생성했음)
+                act_ty,           // activations
+                GGML_TYPE_F16     // KV cache
+            );
+            flops_per_run += a.flops;
+            bytes_per_run += a.bytes;
+        }
+        else if (current_op_name == "FFN") {
+            // 그래프에서 F를 안전하게 추출
+            ggml_tensor * w_up = ggml_get_tensor(ctx.get(), "w_up");
+            ggml_tensor * w_dn = ggml_get_tensor(ctx.get(), "w_down");
+            int F = 0;
+            if (w_up)      F = (int) w_up->ne[1];   // [E,F]
+            else if (w_dn) F = (int) w_dn->ne[0];   // [F,E]
+            else           F = (int) (E * 4);       // fallback (모델에 따라 조정)
+
+            FFNCost f = estimate_ffn_cost_closed_form_runtime(
+                E, F, N,
+                (w_up ? w_up->type : GGML_TYPE_Q8_0),  // 실제 weight dtype 선호
+                act_ty
+            );
+            flops_per_run = f.flops;
+            bytes_per_run = f.bytes;
+        }else if (current_op_name == "KQV") {
+            // KQV 전용 닫힌형 (간단 버전)
+            const double dE = (double)E;
+            const double dH = (double)H;
+            const double dD = (double)(E / H);
+            const double dN = (double)N;
+            const double dL = (double)L;
+
+            const double fl_qkt = 2.0 * dH * dN * dL * dD;
+            const double fl_av  = 2.0 * dH * dN * dL * dD;
+            const double fl_wo  = 2.0 * dE * dE * dN;
+            flops_per_run = fl_qkt + fl_av + fl_wo;
+
+            const int bW  = bpp_ggml_type(GGML_TYPE_Q8_0);
+            const int bA  = bpp_ggml_type(GGML_TYPE_F32);
+            const int bKV = bpp_ggml_type(GGML_TYPE_F16);
+
+            const double bytes_w_wo   = dE * dE * bW;
+            const double bytes_Q      = dH * dD * dN * bA;   // 이미 RoPE된 Q
+            const double bytes_out    = dE * dN * bA;
+
+            // (옵션) K/V 스트리밍 read 포함
+            const bool INCLUDE_KV_STREAM_READS = false; // KQV만 볼 때는 보통 포함하는 게 직관적
+            const double bytes_read_K = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
+            const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
+
+            bytes_per_run = bytes_w_wo + bytes_Q + bytes_out + bytes_read_K + bytes_read_V;
+
+        } else if (current_op_name == "QKVPROJ") {
+            // Q/K/V projection only:
+            //   Q = Wq[E,E] * X[E,N]
+            //   K = Wk[E,D*Hkv] * X[E,N]
+            //   V = Wv[E,D*Hkv] * X[E,N]
+            // 여기서는 RoPE/softmax/AV/Wo는 하지 않음
+
+            // head dim
+            const double dE  = (double) E;
+            const double dH  = (double) H;
+            const double dD  = dE / dH;           // = E/H
+            const double dHk = (double) Hkv;
+            const double dN  = (double) N;
+
+            // 가중치 dtype/활성 dtype은 실제 텐서에서 우선 취득 (없으면 기본값)
+            ggml_tensor * wq = ggml_get_tensor(ctx.get(), "wq");
+            ggml_tensor * wk = ggml_get_tensor(ctx.get(), "wk");
+            ggml_tensor * wv = ggml_get_tensor(ctx.get(), "wv");
+            const ggml_type w_ty_q = wq ? wq->type : GGML_TYPE_Q8_0;
+            const ggml_type w_ty_k = wk ? wk->type : GGML_TYPE_Q8_0;
+            const ggml_type w_ty_v = wv ? wv->type : GGML_TYPE_Q8_0;
+
+            const int bWq = bpp_ggml_type(w_ty_q);
+            const int bWk = bpp_ggml_type(w_ty_k);
+            const int bWv = bpp_ggml_type(w_ty_v);
+            const int bA  = bpp_ggml_type(act_ty); // activations
+
+            // ── FLOPs (2*M*N*K):
+            // Q: 2*E*E*N
+            const double fl_q  = 2.0 * dE * dE * dN;
+            // K: 2*E*(D*Hkv)*N
+            const double fl_k  = 2.0 * dE * (dD * dHk) * dN;
+            // V: same as K
+            const double fl_v  = fl_k;
+
+            flops_per_run = fl_q + fl_k + fl_v;
+
+            // ── Bytes:
+            // (옵션) 가중치 1-pass read 포함
+            static constexpr bool INCLUDE_WEIGHT_BYTES = true;
+            const double bytes_wq = dE * dE            * bWq;
+            const double bytes_wk = dE * (dD * dHk)    * bWk;
+            const double bytes_wv = dE * (dD * dHk)    * bWv;
+            const double weight_bytes = INCLUDE_WEIGHT_BYTES ? (bytes_wq + bytes_wk + bytes_wv) : 0.0;
+
+            // 활성: X read + (Q/K/V materialize) write (최소 근사, 1-pass)
+            const double bytes_X = dE * dN * bA;
+            const double bytes_Q = (dH * dD)  * dN * bA;   // = E * N
+            const double bytes_K = (dHk*dD)  * dN * bA;   // = (E/H*Hkv) * N
+            const double bytes_V = (dHk*dD)  * dN * bA;
+
+            bytes_per_run = weight_bytes + (bytes_X + bytes_Q + bytes_K + bytes_V);
+
+            // fprintf(stderr,
+            //   "[qkv-cost] N=%d :: FLOPs{Q=%.3e, K=%.3e, V=%.3e} sum=%.3e  |  bytes(MB)=Wq+Wk+Wv:%.2f  X:%.2f  Q:%.2f  K:%.2f  V:%.2f  total:%.2f\n",
+            //   N, fl_q, fl_k, fl_v, flops_per_run,
+            //   (weight_bytes/1e6), (bytes_X/1e6), (bytes_Q/1e6), (bytes_K/1e6), (bytes_V/1e6), (bytes_per_run/1e6));
         } else {
-            // 기존 로직 유지 (MUL_MAT / FLASH_ATTN_EXT 등)
-            // 아래에서 다시 계산
+            flops_per_run = 0.0;
+            bytes_per_run = std::max<double>(ggml_nbytes(out), 1);
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // n_runs 결정: ATTENTION/FFN이면 우리가 계산한 FLOPs 기준으로 타겟 러닝 시간 맞춤
-        // ─────────────────────────────────────────────────────────────
-        int n_runs = 1;
-        bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        
+        fprintf(stderr,
+            "[perf-debug] per-run: flops=%.3e  bytes=%.3e  AI=%.6f\n",
+            flops_per_run, bytes_per_run,
+            (bytes_per_run > 0.0 ? flops_per_run / bytes_per_run : 0.0));
 
-        if (is_attention_subgraph || is_ffn_subgraph) {
+
+        // n_runs 결정 (타겟 총 FLOPs 기준) -- not used now
+        // Minsung Note: 
+        int n_runs = 1;
+        {
             const uint64_t GFLOP = 1000ull * 1000ull * 1000ull;
-            const uint64_t target_flops_cpu =   8ULL * GFLOP;
-            const uint64_t target_flops_gpu = 100ULL * GFLOP;
-            uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-            if (model_flops_per_run > 0.0) {
-                n_runs = std::max<int>(1, (int)(target_flops / model_flops_per_run));
-            }
-        } else {
-            // 기존 단일 op 경로 유지
-            if (op_flops(out) > 0) {
-                const uint64_t GFLOP = 1000 * 1000 * 1000;
-                const uint64_t target_flops_cpu =   8ULL * GFLOP;
-                const uint64_t target_flops_gpu = 100ULL * GFLOP;
-                uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-                n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
+            const uint64_t target_flops_cpu = 100ULL * GFLOP; // 100 GFLOP 정도
+            const uint64_t target_flops_gpu = 100ULL * GFLOP; // 100 GFLOP 정도
+            const uint64_t target_flops     = is_cpu ? target_flops_cpu : target_flops_gpu;
+
+            if (flops_per_run > 0.0) {
+                n_runs = std::max<int>(1, (int)(target_flops / flops_per_run));
             } else {
+                // FLOPs 추정이 0이면 (있을 수 있음) 메모리 사이즈로 결정
                 const size_t GB = 1ULL << 30;
                 const size_t target_size_cpu =  8 * GB;
                 const size_t target_size_gpu = 32 * GB;
                 size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
-                n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+                // out만 기준으로 잡되, 너무 작으면 1회
+                size_t sz = std::max<size_t>(ggml_nbytes(out), 1);
+                n_runs = std::max<int>(1, (int)(target_size / sz));
             }
         }
 
-        for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
+        {
+            const size_t capacity = ggml_graph_size(gf);        // 총 슬롯
+            const size_t used     = ggml_graph_n_nodes(gf);     // 이미 사용중
+            // 우리가 추가할 노드 수는 (n_runs - 1)개
+            // 따라서 허용 가능한 최대 n_runs는:
+            const size_t room     = (capacity > used) ? (capacity - used) : 0;
+            const int max_runs_by_capacity = (room >= 1) ? (int)(room + 1) : 1; // used+(n_runs-1) <= capacity
+            if (n_runs > max_runs_by_capacity) {
+                // 필요시 경고 출력
+                // fprintf(stderr, "[perf] n_runs clamped from %d to %d (graph capacity)\n", n_runs, max_runs_by_capacity);
+                n_runs = max_runs_by_capacity;
+            }
         }
 
-        // 기존 메모리 누적(그래프 기반)도 유지
-        size_t mem = n_runs * op_size(out);
-        auto tensor_op_size = [](ggml_tensor * t) {
-            size_t size = ggml_nbytes(t);
-            for (int i = 0; i < GGML_MAX_SRC; i++) if (t->src[i] != NULL) size += ggml_nbytes(t->src[i]);
-            return size;
-        };
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) continue;
-            mem += tensor_op_size(ggml_graph_node(gf, i));
-        }
+        // 최소 측정시간: 환경변수로 조절 가능하게 하면 편함 (기본 1000ms)
+        const int64_t min_duration_us = 10000 * 1000;
 
-        // 실행
         int64_t total_time_us = 0;
-        int64_t total_mem = 0;
-        int total_runs = 0;
+        int     total_runs    = 0;
+
         do {
-            int64_t start_time = ggml_time_us();
-            ggml_status status = ggml_backend_graph_compute(backend, gf);
-            if (status != GGML_STATUS_SUCCESS) {
-                fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+            const int64_t start_us = ggml_time_us();
+
+            
+            ggml_status st = ggml_backend_graph_compute(backend, gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "%s: compute failed. status=%s\n",
+                        __func__, ggml_status_to_string(st));
                 return false;
             }
-            int64_t end_time = ggml_time_us();
-            total_time_us += end_time - start_time;
-            total_mem += mem;
-            total_runs += n_runs;
-        } while (total_time_us < 1000*1000); // 최소 1초
 
-        // ─────────────────────────────────────────────────────────────
-        // ★★★ 결과 계산: ATTENTION/FFN이면 우리 공식으로 AI/GFLOPS 산출
-        // ─────────────────────────────────────────────────────────────
-        double avg_time_us = (double) total_time_us / total_runs;
+            const int64_t dt = ggml_time_us() - start_us;
+            std::cout << "Run: " << total_runs << " latency: " << dt << " us \n";
+            total_time_us += dt;
+            total_runs++;     
+        // Minsung Note: currently runs test case only one time.
+        // There is no difference in results for single run and multiple run.
+        } while (total_runs < 1);
 
-        double AI_flops_per_byte = 0.0;
-        double calculated_flops  = 0.0; // [FLOP/s]
-        double calculated_bandwidth = 0.0;
+        // 집계
+        const double secs        = total_time_us / 1e6;
+        const double total_flops = flops_per_run * total_runs;
+        const double gflops      = (secs > 0.0) ? (total_flops / secs / 1e9) : 0.0;
+        const double ai_flops_per_byte = (bytes_per_run > 0.0) ? (flops_per_run / bytes_per_run) : 0.0;
+        const double bandwidth_GBps    = (secs > 0.0 && bytes_per_run > 0.0)
+                                    ? ((bytes_per_run * total_runs) / secs / (1024.0*1024.0*1024.0))
+                                    : 0.0;
 
-        if (is_attention_subgraph || is_ffn_subgraph) {
-            const double secs = total_time_us / 1e6;
-            const double total_flops = model_flops_per_run * total_runs;
-            calculated_flops = total_flops / secs;                 // FLOP/s
-            AI_flops_per_byte = (bytes_per_run > 0.0) ? (model_flops_per_run / bytes_per_run) : 0.0;
-            calculated_bandwidth = 0.0; // 필요시 bytes_per_run * total_runs / secs 로 추정 가능
-        } else {
-            // 기존 단일 op 경로
-            if (current_op_name == "MUL_MAT") {
-                size_t bytes_A = ggml_nbytes(a);
-                size_t bytes_B = ggml_nbytes(b);
-                size_t bytes_C = ggml_nbytes(out);
-                double bytes_per_run = (double)bytes_A + (double)bytes_B + (double)bytes_C;
-                AI_flops_per_byte = op_flops(out) / bytes_per_run;
-            } else if (current_op_name == "FLASH_ATTN_EXT") {
-                double bytes_per_run = ggml_nbytes(q) + ggml_nbytes(k) + ggml_nbytes(v)
-                                    + ggml_nbytes(out) + (m ? ggml_nbytes(m) : 0);
-                AI_flops_per_byte = op_flops(out) / bytes_per_run;
-            }
-            calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
-            calculated_bandwidth = (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
-        }
-
+        double avg_time_us      = (double) total_time_us / total_runs;
         size_t calculated_memory_kb = op_size(out) / 1024;
 
-        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "",
-                          avg_time_us,
-                          calculated_flops,          // FLOP/s
-                          AI_flops_per_byte,         // AI
-                          calculated_bandwidth,      // BW (op-only 경로에서만)
-                          calculated_memory_kb, total_runs);
+        test_result result(
+            ggml_backend_name(backend),
+            current_op_name,
+            vars(),
+            "perf",
+            true,
+            true,
+            "",
+            avg_time_us,
+            gflops,                // FLOP/s
+            ai_flops_per_byte,     // AI
+            bandwidth_GBps,        // Bandwidth (GB/s)
+            calculated_memory_kb,
+            total_runs
+        );
+        result.per_run_flops = flops_per_run;  
+        result.per_run_bytes = bytes_per_run;  
+        std::cout << "flops_per_run: " << flops_per_run << " bytes_per_run: " << bytes_per_run << "\n";
 
-        if (output_printer) output_printer->print_test_result(result);
+        if (output_printer) {
+            output_printer->print_test_result(result);
+        }
 
         return true;
     }
+
 
 
     bool eval_support(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
@@ -5040,18 +5294,14 @@ struct test_llama : public test_llm {
 
 // Minsung Note:
 // Explicitly added for attention roofline test.
-// tensor bytes
-static inline size_t tensor_nbytes_rows(const ggml_tensor * t) {
-    size_t rowsz = ggml_row_size(t->type, t->ne[0]);
-    return rowsz * (size_t)std::max<int64_t>(1, t->ne[1]);
-}
-
-
 enum class Subgraph {
     AttentionOnly,
     FFNOnly,
-    AttentionThenFFN, 
+    AttentionThenFFN,
+    KQVOnly,  
+    QKVProj,
 };
+
 
 struct test_attention : public test_llm {
     static constexpr float freq_base  = 500000;
@@ -5069,6 +5319,8 @@ struct test_attention : public test_llm {
         switch (subgraph) {
             case Subgraph::AttentionOnly:    return "ATTENTION";
             case Subgraph::FFNOnly:          return "FFN";
+            case Subgraph::KQVOnly: return "KQV"; 
+            case Subgraph::QKVProj: return "QKVPROJ";
             case Subgraph::AttentionThenFFN: return "ATTN_FFN"; // 둘 다일 때 구분용
         }
         return "ATTENTION";
@@ -5102,6 +5354,20 @@ struct test_attention : public test_llm {
     , fused(fused)
     , subgraph(sg)
     {
+                            // 참고 출력
+        const char * sg_name = (glob_subgraph == 0 ? "attn" :
+                                glob_subgraph == 1 ? "ffn"  :
+                                glob_subgraph == 3 ? "kqv"  :
+                                glob_subgraph == 4 ? "qkvproj"  : "both");
+        std::cout 
+                    << "Creating [" << sg_name << "] compute graph n_vocab="    << glob_n_vocab
+                    << " n_embd="                << glob_n_embed
+                    << " n_head="                << glob_n_head
+                    << " n_head_kv="             << glob_n_head_kv
+                    << " n_ctx="                 << glob_n_ctx
+                    << " n_past="                << glob_n_past
+                    << " n_tokens="              << glob_n_tokens
+                    << "\n";
         hp.n_ctx      = n_ctx;
         hp.n_ctx_orig = n_ctx;
         hp.n_past     = n_past;
@@ -5125,9 +5391,9 @@ struct test_attention : public test_llm {
         GGML_ASSERT(hp.kv_head + hp.n_tokens <= hp.n_ctx);
     }
 
-
+    // Minsung Note:
+    // Builds computation graph depending on user input.
     ggml_tensor * build_graph(ggml_context * ctx) override {
-    std::cout << "build_graph" << "\n";
 
     if (hp.n_tokens <= 0) hp.n_tokens = std::max(1, hp.n_kv - hp.n_past);
     hp.n_kv    = hp.n_past + hp.n_tokens;
@@ -5159,7 +5425,6 @@ struct test_attention : public test_llm {
 
     // Attention subgraph
     auto build_attention_only = [&](ggml_tensor * inp) -> ggml_tensor * {
-        std::cout << "build_attention_only" << "\n";
         ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
         ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
         ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
@@ -5182,9 +5447,68 @@ struct test_attention : public test_llm {
 
         ggml_tensor * attn_out = llm_build_kqv_modified(ctx, k_l, v_l, Q, KQ_mask, 1.0f/std::sqrt((float)hp.n_embd_head));
         ggml_set_name(attn_out, "attn_out");
+        return attn_out;
+    };
 
-        ggml_tensor * out = ggml_mul_mat(ctx, wo, attn_out);
-        ggml_set_name(out, "attn_out_wo");
+    auto build_kqv_only = [&](ggml_tensor * /*inp_unused*/) -> ggml_tensor * {
+
+        // 1) Q_cur  : [D, H, N] (F32)
+        ggml_tensor * q_cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                                                hp.n_embd_head,  // D
+                                                hp.n_head,       // H
+                                                hp.n_tokens);    // N
+        ggml_set_name(q_cur, "q_cur"); // 랜덤 init은 initialize_tensors(ctx)에서 수행
+
+        // 2) 마스크  : [L, N, 1] (F16)
+        //    - L = hp.n_kv = n_past + n_tokens  (prefill이면 L = N)
+        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                hp.n_kv,         // L
+                                                hp.n_tokens,     // N
+                                                1);
+        ggml_set_name(kq_mask, "mask"); // eval_perf가 여기 이름으로 찾음
+
+        // 3) pos 도 만들어줘야 eval_perf가 안죽음 (실사용 안해도 됨)
+        ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, hp.n_tokens);
+        ggml_set_name(inp_pos, "pos");
+
+        // 4) KV 캐시 버퍼 (F16)
+        //    - view stride 가 n_ctx/embd_gqa 가정이 있으니 기존 계산과 동일하게 확보
+        const int64_t kv_elems_all = (int64_t) hp.n_layer * hp.n_head_kv * hp.n_embd_head * hp.n_ctx;
+        ggml_tensor * k_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+        ggml_tensor * v_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+        ggml_set_name(k_l, "k_cache");
+        ggml_set_name(v_l, "v_cache");
+
+        // 5) 코어 호출 (내부에서 softmax + AV + Wo 까지 수행)
+        //    - scale = 1/sqrt(D)
+        ggml_tensor * out = llm_build_kqv_modified(ctx, k_l, v_l, q_cur, kq_mask,
+                                                1.0f/std::sqrt((float)hp.n_embd_head));
+        ggml_set_name(out, "kqv_core_out");
+        return out;
+    };
+
+    // QKV projection
+    auto build_qkv_only = [&](ggml_tensor * inp) -> ggml_tensor * {
+
+        // 가중치
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
+        ggml_set_name(wq, "wq"); ggml_set_name(wk, "wk"); ggml_set_name(wv, "wv");
+
+        // Q/K/V 투영
+        ggml_tensor * Q = ggml_mul_mat(ctx, wq, inp); ggml_set_name(Q, "Q_mm");
+        ggml_tensor * K = ggml_mul_mat(ctx, wk, inp); ggml_set_name(K, "K_mm");
+        ggml_tensor * V = ggml_mul_mat(ctx, wv, inp); ggml_set_name(V, "V_mm");
+
+        // 그래프에서 K/V가 사라지지 않도록 Q에 의존성 걸어줌
+        //  - sum(K)+sum(V) → Q와 동일 shape로 repeat → Q와 더함
+        ggml_tensor * sK     = ggml_sum(ctx, K);              ggml_set_name(sK, "sum_K");
+        ggml_tensor * sV     = ggml_sum(ctx, V);              ggml_set_name(sV, "sum_V");
+        ggml_tensor * sKV    = ggml_add(ctx, sK, sV);         ggml_set_name(sKV, "sum_KV");
+        ggml_tensor * sKVrep = ggml_repeat(ctx, sKV, Q);      ggml_set_name(sKVrep, "sum_KV_rep");
+        ggml_tensor * out    = ggml_add(ctx, Q, sKVrep);      ggml_set_name(out, "qkv_only_out");
+
         return out;
     };
 
@@ -5207,6 +5531,10 @@ struct test_attention : public test_llm {
         cur = build_attention_only(cur);
     } else if (subgraph == Subgraph::FFNOnly) {
         cur = build_ffn_only(cur);
+    } else if (subgraph == Subgraph::KQVOnly) {
+        cur = build_kqv_only(cur);
+    } else if (subgraph == Subgraph::QKVProj) {
+        cur = build_qkv_only(cur);
     } else {
         cur = build_attention_only(cur);
         cur = build_ffn_only(cur);
@@ -6324,19 +6652,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {256, 256, 3, 1}));
 
 
-    // Minsung modified
-    // Note: for attention test
+    // Minsung Note:
+    // Creates Attention test case. 
     Subgraph sg = Subgraph::AttentionOnly;
     if (glob_subgraph == 1) sg = Subgraph::FFNOnly;
     else if (glob_subgraph == 2) sg = Subgraph::AttentionThenFFN;
+    else if (glob_subgraph == 3) sg = Subgraph::KQVOnly;
+    else if (glob_subgraph == 4) sg = Subgraph::QKVProj;
 
-    test_cases.emplace_back(new test_attention(
+    // These default params creates same environment as LLAMA3-3.2B-Instruct Q8
+    test_cases.emplace_back(new test_attention( 
         /*n_tokens=*/glob_n_tokens,
-        /*n_vocab=*/ (glob_n_vocab   ? glob_n_vocab   : 32000),
-        /*n_embd=*/  (glob_n_embed   ? glob_n_embed   : 3200),
-        /*n_head=*/  (glob_n_head    ? glob_n_head    : 32),
-        /*n_head_kv*/(glob_n_head_kv ? glob_n_head_kv : 32),
-        /*n_ctx=*/   (glob_n_ctx      ? glob_n_ctx      : 512),
+        /*n_vocab=*/ (glob_n_vocab   ? glob_n_vocab   : 128256),
+        /*n_embd=*/  (glob_n_embed   ? glob_n_embed   : 3072),
+        /*n_head=*/  (glob_n_head    ? glob_n_head    : 24),
+        /*n_head_kv*/(glob_n_head_kv ? glob_n_head_kv : 8),
+        /*n_ctx=*/   (glob_n_ctx      ? glob_n_ctx      : 8192),
         /*n_past=*/   glob_n_past,
         /*n_kv_runtime=*/-1,
         /*kv_head_rt=*/ -1,
@@ -6402,6 +6733,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_names_filter, output_printer);
         }
+        ggml_backend_free(backend);
         return true;
     }
 
@@ -6421,14 +6753,33 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
-    // Minsung note
+    // Minsung note:
     // How to use (ATTENTION microbench):
     /*
     Basic form
     ----------
-    ./binary_name perf -o ATTENTION <key=value ...> CPU [-t <threads>]
+    ./binary_name perf -o [test case] <params, key=value ...> -b CPU [-t <threads>]
 
-    ATTENTION keys (key=value)
+    [test case]
+    --------------------------
+    ATTENTION  : tests attention (KQV + QKV projection, w/o FFN)
+                ex) ./tllm_profiler perf -o ATTENTION n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=0 n_tokens=100 -b CPU -t 1 
+                    or simply ./tllm_profiler perf -o ATTENTION n_past=0 n_tokens=100 -b CPU -t 1 
+                    (the defualt params(n_vocab, n_embd,,,) are already set to LLAMA model)
+    FFN        : tests FFN only
+                ex) ./tllm_profiler perf -o FFN n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=0 n_tokens=100 -b CPU -t 1 
+                    or simply ./tllm_profiler perf -o FFN n_past=0 n_tokens=100 -b CPU -t 1 
+    KQV        : tests KQV onlt
+                ex) ./tllm_profiler perf -o KQV n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=0 n_tokens=100 -b CPU -t 1 
+                    or simply ./tllm_profiler perf -o KQV n_past=0 n_tokens=100 -b CPU -t 1 
+    QKVPROJ    : test QKV projection only
+                ex) ./tllm_profiler perf -o QKV n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=0 n_tokens=100 -b CPU -t 1 
+                    or simply ./tllm_profiler perf -o QKV n_past=0 n_tokens=100 -b CPU -t 1 
+    
+    *to bind to single core, 
+    taskset 80 ./binary_name....
+
+    <params (key=value)>
     --------------------------
     n_vocab    : vocab size (e.g., 128256)
     n_embd     : hidden size / embedding dim (e.g., 3072)
@@ -6443,27 +6794,20 @@ int main(int argc, char ** argv) {
         - Typical consistency: n_embd == n_head * n_embd_head (here n_embd_head=128).
         - Memory for KV (per layer, per type) ~ n_head_kv * n_embd_head * n_ctx * sizeof(FP16).
         - For "Llama-3.2-3B-Instruct" : n_vocab=128256, n_embd=3072, n_head=24, n_head_kv=8,
-        n_ctx (practical) 4096~8192, freq_base=500000, n_rot(rope dim)=128.
+        n_ctx (practical) 4096~8192, freq_base=500000, n_rot(rope dim)=128. 
+        (These params are default, however you can change them by giving params)
 
-    Prefill (encode many tokens at once)
+    ## To test Prefill (encode many tokens at once)
     ------------------------------------
     Goal: build fresh KV for N tokens with causal mask.
     Set:  n_past=0, n_tokens=N (e.g., 2048)
-    Example:
-        ./binary_name perf -o ATTENTION \
-        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 \
-        n_ctx=8192 n_past=0 n_tokens=2048 -b CPU
 
-    Decode (generate next token(s) given past L)
+    ## To test Decode (generate next token(s) given past L)
     --------------------------------------------
     Goal: attend to past L and add 1 new token into KV at position L.
     Set:  n_past=L, n_tokens=1
-    Example (single step, L=2048):
-        ./binary_name perf -o ATTENTION \
-        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 \
-        n_ctx=8192 n_past=2048 n_tokens=1 -b CPU
-
-    Multi-step decode loop (concept)
+    
+    ## To test multi-step decode loop (concept)
     --------------------------------
     For k steps, increment n_past each step:
         step 0: n_past=L,     n_tokens=1
@@ -6471,19 +6815,12 @@ int main(int argc, char ** argv) {
         ...
         step k: n_past=L+k,   n_tokens=1
     (Each step appends 1 position to KV and attends to length L+step+1.)
+    -> needs extra impelementation
 
     Backend/threads examples
     ------------------------
     CUP backend, 6 threads:
         ./binary_name perf -o ATTENTION ... -b CPU -t 6
-
-    Quick presets
-    -------------
-    Llama-3.2-3B-like prefill (practical context):
-        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=0 n_tokens=1024
-
-    Llama-3.2-3B-like decode from L=1024:
-        n_vocab=128256 n_embd=3072 n_head=24 n_head_kv=8 n_ctx=8192 n_past=1024 n_tokens=1
 
     Troubleshooting
     ---------------
@@ -6513,9 +6850,25 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 op_names_filter = argv[++i];
-
                 // ★ ATTENTION일 때, 이어지는 key=value 들을 파싱
-                if (strcmp(op_names_filter, "ATTENTION") == 0) {
+                if (strcmp(op_names_filter, "ATTENTION") == 0 || strcmp(op_names_filter, "FFN") == 0 ||
+                    strcmp(op_names_filter, "ATTN_FFN") == 0 || strcmp(op_names_filter, "KQV") == 0 ||
+                    strcmp(op_names_filter, "QKVPROJ") == 0) {
+                    {                            
+                        if (strcmp(op_names_filter, "ATTENTION") == 0) {
+                            glob_subgraph = 0;
+                        }else if (strcmp(op_names_filter, "KQV") == 0){
+                            glob_subgraph = 3;
+                        }else if (strcmp(op_names_filter, "QKVPROJ") == 0){
+                            glob_subgraph = 4;
+                        }else if (strcmp(op_names_filter, "FFN") == 0) {
+                            glob_subgraph = 1;
+                        } else {
+                            std::cout << "OP PARSING ERROR.. -o [OP] should be one of ATTENTION, KQV, QKVPROJ, FFN" << "\n";
+                            exit(-1);
+                        } 
+                        
+                    }
                     auto parse_kv = [](const char * s, const char * key, int & out) -> bool {
                         // key=number 형태만 수용
                         size_t klen = strlen(key);
@@ -6525,16 +6878,6 @@ int main(int argc, char ** argv) {
                         }
                         return false;
                     };
-                    // ★ 문자값 파싱 헬퍼 (예: sg=attn / ffn / both)
-                    auto parse_kv_str = [](const char * s, const char * key, std::string & out) -> bool {
-                        size_t klen = strlen(key);
-                        if (strncmp(s, key, klen) == 0 && s[klen] == '=') {
-                            out = std::string(s + klen + 1);
-                            return true;
-                        }
-                        return false;
-                    };
-
                     // 다음 옵션(-로 시작) 나오기 전까지 key=value 소비
                     while (i + 1 < argc && argv[i + 1][0] != '-') {
                         const char * tok = argv[++i];
@@ -6549,36 +6892,6 @@ int main(int argc, char ** argv) {
                         if (parse_kv(tok, "n_past",     glob_n_past))    continue;
                         if (parse_kv(tok, "n_tokens",   glob_n_tokens))  continue;
 
-                        // ★ sg= 문자열/숫자 모두 지원
-                        {
-                            std::string sg_str;
-                            if (parse_kv_str(tok, "sg", sg_str)) {
-                                // 문자열 케이스
-                                if (sg_str == "attn" || sg_str == "ATTN" || sg_str == "attention") {
-                                    glob_subgraph = 0;
-                                } else if (sg_str == "ffn" || sg_str == "FFN") {
-                                    glob_subgraph = 1;
-                                } else if (sg_str == "both" || sg_str == "all" || sg_str == "ATTN_FFN") {
-                                    glob_subgraph = 2;
-                                } else {
-                                    // 숫자도 허용: 0/1/2
-                                    try {
-                                        glob_subgraph = std::stoi(sg_str);
-                                    } catch (...) {
-                                        std::cerr << "[ATTENTION] sg invalid: " << sg_str
-                                                  << " (use sg=attn|ffn|both or sg=0|1|2). Defaulting to attn.\n";
-                                        glob_subgraph = 0;
-                                    }
-                                }
-                                // 범위 클램프
-                                if (glob_subgraph < 0 || glob_subgraph > 2) {
-                                    std::cerr << "[ATTENTION] sg out of range: " << glob_subgraph
-                                              << " (valid 0/1/2). Defaulting to 0(attn).\n";
-                                    glob_subgraph = 0;
-                                }
-                                continue;
-                            }
-                        }
 
                         // 알 수 없는 토큰은 경고만
                         std::cerr << "[ATTENTION] Unknown arg: " << tok
@@ -6598,19 +6911,6 @@ int main(int argc, char ** argv) {
                         std::cerr << "[ATTENTION] n_past < 0 is invalid; clamping to 0\n";
                         glob_n_past = 0;
                     }
-
-                    // 참고 출력
-                    const char * sg_name = (glob_subgraph == 0 ? "attn" :
-                                            glob_subgraph == 1 ? "ffn"  : "both");
-                    std::cout << "[ATTENTION] n_vocab="    << glob_n_vocab
-                              << " n_embd="                << glob_n_embed
-                              << " n_head="                << glob_n_head
-                              << " n_head_kv="             << glob_n_head_kv
-                              << " n_ctx="                 << glob_n_ctx
-                              << " n_past="                << glob_n_past
-                              << " n_tokens="              << glob_n_tokens
-                              << " sg="                    << sg_name
-                              << "\n";
                 }
             } else {
                 usage(argv);
@@ -6728,11 +7028,10 @@ int main(int argc, char ** argv) {
         }
         output_printer->print_backend_status(
             backend_status_info(ggml_backend_name(backend), ok ? test_status_t::OK : test_status_t::FAIL));
-        std::cout << "h" << "\n";
-        ggml_backend_free(backend);
+        
+        // ggml_backend_free(backend);
     }
 
-    std::cout << "i" << "\n";
     ggml_quantize_free();
 
     if (output_printer) {
@@ -6745,7 +7044,6 @@ int main(int argc, char ** argv) {
     if (n_ok != ggml_backend_dev_count()) {
         return 1;
     }
-    std::cout << "j" << "\n";
 
 
     return 0;
