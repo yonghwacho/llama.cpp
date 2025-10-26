@@ -1,4 +1,5 @@
 #include "ggml-dvfs.h"
+#include "ggml-mckp-freq.h" // (10.27, wjbang) MCKP solver header
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
