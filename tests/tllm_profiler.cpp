@@ -1684,7 +1684,7 @@ struct test_case {
             );
             flops_per_run = f.flops;
             bytes_per_run = f.bytes;
-        }else if (current_op_name == "KQV") {
+        }else if (current_op_name == "KQVOUTPROJ") {
             // KQV 전용 닫힌형 (간단 버전)
             const double dE = (double)E;
             const double dH = (double)H;
@@ -1711,14 +1711,32 @@ struct test_case {
             const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
 
             bytes_per_run = bytes_w_wo + bytes_Q + bytes_out + bytes_read_K + bytes_read_V;
+        }else if (current_op_name == "KQV") { // KQV without out projection (KQVONLY)
+            // KQV 전용 닫힌형 (간단 버전)
+            const double dE = (double)E;
+            const double dH = (double)H;
+            const double dD = (double)(E / H);
+            const double dN = (double)N;
+            const double dL = (double)L;
 
+            const double fl_qkt = 2.0 * dH * dN * dL * dD;
+            const double fl_av  = 2.0 * dH * dN * dL * dD;
+            flops_per_run = fl_qkt + fl_av;
+
+            const int bW  = bpp_ggml_type(GGML_TYPE_Q8_0);
+            const int bA  = bpp_ggml_type(GGML_TYPE_F32);
+            const int bKV = bpp_ggml_type(GGML_TYPE_F16);
+
+            const double bytes_w_wo   = dE * dE * bW;
+            const double bytes_Q      = dH * dD * dN * bA;   // 이미 RoPE된 Q
+
+            // (옵션) K/V 스트리밍 read 포함
+            const bool INCLUDE_KV_STREAM_READS = false; // KQV만 볼 때는 보통 포함하는 게 직관적
+            const double bytes_read_K = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
+            const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
+
+            bytes_per_run = bytes_w_wo + bytes_Q + bytes_read_K + bytes_read_V;
         } else if (current_op_name == "QKVPROJ") {
-            // Q/K/V projection only:
-            //   Q = Wq[E,E] * X[E,N]
-            //   K = Wk[E,D*Hkv] * X[E,N]
-            //   V = Wv[E,D*Hkv] * X[E,N]
-            // 여기서는 RoPE/softmax/AV/Wo는 하지 않음
-
             // head dim
             const double dE  = (double) E;
             const double dH  = (double) H;
@@ -1769,7 +1787,67 @@ struct test_case {
             //   "[qkv-cost] N=%d :: FLOPs{Q=%.3e, K=%.3e, V=%.3e} sum=%.3e  |  bytes(MB)=Wq+Wk+Wv:%.2f  X:%.2f  Q:%.2f  K:%.2f  V:%.2f  total:%.2f\n",
             //   N, fl_q, fl_k, fl_v, flops_per_run,
             //   (weight_bytes/1e6), (bytes_X/1e6), (bytes_Q/1e6), (bytes_K/1e6), (bytes_V/1e6), (bytes_per_run/1e6));
-        } else {
+        } 
+        else if (current_op_name == "LMHEAD") {
+            // logits = W_lm[E, V] * X[E, N] -> [V, N]
+            // FLOPs = 2 * E * V * N
+            // Bytes ≈ W_lm read + X read + logits write  (최소 근사, softmax 제외)
+            ggml_tensor * w_lm = ggml_get_tensor(ctx.get(), "lm_head");
+            const int    V     = w_lm ? (int) w_lm->ne[1] : (int)glob_n_vocab; // [E,V]에서 V는 ne[1]
+            const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_Q8_0;
+
+            const double dE = (double) E;
+            const double dV = (double) V;
+            const double dN = (double) N;
+
+            // FLOPs
+            const double fl = 2.0 * dE * dV * dN;
+
+            // Bytes
+            static constexpr bool INCLUDE_WEIGHT_BYTES = true;
+            const int bW = bpp_ggml_type(w_ty);
+            const int bA = bpp_ggml_type(act_ty);
+
+            const double bytes_w  = dE * dV * bW;   // W_lm
+            const double bytes_x  = dE * dN * bA;   // X
+            const double bytes_y  = dV * dN * bA;   // logits
+            const double bytes    = (INCLUDE_WEIGHT_BYTES ? bytes_w : 0.0) + bytes_x + bytes_y;
+
+            flops_per_run = fl;
+            bytes_per_run = bytes;
+
+            // fprintf(stderr, "[lmhead-cost] E=%d V=%d N=%d :: flops=%.3e bytes(MB)=%.2f\n",
+            //         E, V, N, fl, bytes/1e6);
+        }
+        else if (current_op_name == "OUTPROJ") {
+            // out = W_o[E, E] * Y[E, N] -> [E, N]
+            // FLOPs = 2 * E * E * N
+            // Bytes ≈ W_o read + Y read + out write  (최소 근사)
+            ggml_tensor * w_o = ggml_get_tensor(ctx.get(), "wo_only");
+            const ggml_type w_ty = w_o ? w_o->type : GGML_TYPE_Q8_0;
+
+            const double dE = (double) E;
+            const double dN = (double) N;
+
+            // FLOPs
+            const double fl = 2.0 * dE * dE * dN;
+
+            // Bytes
+            static constexpr bool INCLUDE_WEIGHT_BYTES = true;
+            const int bW = bpp_ggml_type(w_ty);
+            const int bA = bpp_ggml_type(act_ty);
+
+            const double bytes_w  = dE * dE * bW;   // W_o
+            const double bytes_x  = dE * dN * bA;   // input activations
+            const double bytes_y  = dE * dN * bA;   // output activations
+            const double bytes    = (INCLUDE_WEIGHT_BYTES ? bytes_w : 0.0) + bytes_x + bytes_y;
+
+            flops_per_run = fl;
+            bytes_per_run = bytes;
+
+            // fprintf(stderr, "[outproj-cost] E=%d N=%d :: flops=%.3e bytes(MB)=%.2f\n",
+            //         E, N, fl, bytes/1e6);
+        }else {
             flops_per_run = 0.0;
             bytes_per_run = std::max<double>(ggml_nbytes(out), 1);
         }
@@ -5147,6 +5225,65 @@ public:
         return cur;
     }
 
+    struct ggml_tensor * llm_build_kqv_modified_wo_outproj(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_l,      // flat K cache
+        struct ggml_tensor  * v_l,      // flat V cache
+        struct ggml_tensor  * q_cur,    // [head_dim, n_head, n_tokens] (permute 前)
+        struct ggml_tensor  * kq_mask,  // [n_kv, n_tokens, 1] (브로드캐스트)
+        float                 kq_scale  // 1/sqrt(head_dim)
+    ) {
+        // 사전 조건: n_kv == n_past + n_tokens, n_kv <= n_ctx
+        GGML_ASSERT(hp.n_kv <= hp.n_ctx);
+
+        // Q: [head_dim, n_head, n_tokens] -> (내부 곱 편의를 위해) permute
+        struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
+
+        // --- K 읽기 뷰 ---
+        // K 캐시를 [head_dim, n_kv, n_head_kv] 형태로 해석
+        // stride는 기존 코드와 동일한 방식 유지 (프로젝트의 캐시 배치 가정 준수)
+        struct ggml_tensor * k = ggml_view_3d(
+            ctx,
+            k_l,
+            /*ne0=*/hp.n_embd_head,                            // head_dim
+            /*ne1=*/hp.n_kv,                                   // seq len to attend
+            /*ne2=*/hp.n_head_kv,                              // kv heads
+            /*nb1=*/ggml_row_size(k_l->type, hp.n_embd_gqa()), // stride over seq
+            /*nb2=*/ggml_row_size(k_l->type, hp.n_embd_head),  // stride over kv_head
+            /*offset=*/0
+        );
+
+        // QK^T
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+
+        // softmax with mask (prefill/decode 공용)
+        // - prefill: causal N×N 마스크
+        // - decode : (L+1)×1 마스크 (과거 L 전부 + 현재 1)
+        // kq_mask가 nullptr이 아니면 그대로 사용, nullptr이면 외부에서 causal 처리했다고 가정
+        kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0.0f);
+
+        // --- V 읽기 뷰 ---
+        // V 캐시를 [n_kv, head_dim, n_head_kv]로 해석 (기존 코드 스타일 유지)
+        const size_t v_nb1 = (size_t)hp.n_ctx * ggml_element_size(v_l);
+        const size_t v_nb2 = v_nb1 * (size_t)hp.n_embd_head;
+
+        struct ggml_tensor * v = ggml_view_3d(
+            ctx,
+            v_l,
+            /*ne0=*/hp.n_kv,          // seq len to attend
+            /*ne1=*/hp.n_embd_head,   // head_dim
+            /*ne2=*/hp.n_head_kv,     // kv heads
+            /*nb1=*/v_nb1,
+            /*nb2=*/v_nb2,
+            /*offset=*/0
+        );
+
+        // kqv = V * softmax(QK^T)
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+
+        return kqv;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -5298,8 +5435,11 @@ enum class Subgraph {
     AttentionOnly,
     FFNOnly,
     AttentionThenFFN,
+    KQVOutprojOnly,
     KQVOnly,  
     QKVProj,
+    OutProj,
+    LMHead,
 };
 
 
@@ -5319,9 +5459,12 @@ struct test_attention : public test_llm {
         switch (subgraph) {
             case Subgraph::AttentionOnly:    return "ATTENTION";
             case Subgraph::FFNOnly:          return "FFN";
+            case Subgraph::KQVOutprojOnly: return "KQVOUTPROJ";
             case Subgraph::KQVOnly: return "KQV"; 
             case Subgraph::QKVProj: return "QKVPROJ";
             case Subgraph::AttentionThenFFN: return "ATTN_FFN"; // 둘 다일 때 구분용
+            case Subgraph::OutProj: return "OUTPROJ";
+            case Subgraph::LMHead: return "LMHEAD";
         }
         return "ATTENTION";
     }
@@ -5357,8 +5500,12 @@ struct test_attention : public test_llm {
                             // 참고 출력
         const char * sg_name = (glob_subgraph == 0 ? "attn" :
                                 glob_subgraph == 1 ? "ffn"  :
-                                glob_subgraph == 3 ? "kqv"  :
-                                glob_subgraph == 4 ? "qkvproj"  : "both");
+                                glob_subgraph == 3 ? "kqvoutproj"  :
+                                glob_subgraph == 4 ? "kqv"  :
+                                glob_subgraph == 5 ? "qkv"  :
+                                glob_subgraph == 6 ? "outproj"  :
+                                glob_subgraph == 7 ? "lmhead"  : "???"
+                                );
         std::cout 
                     << "Creating [" << sg_name << "] compute graph n_vocab="    << glob_n_vocab
                     << " n_embd="                << glob_n_embed
@@ -5450,8 +5597,46 @@ struct test_attention : public test_llm {
         return attn_out;
     };
 
-    auto build_kqv_only = [&](ggml_tensor * /*inp_unused*/) -> ggml_tensor * {
+    // KQV (without outprojection. see llm_build_kqv_modified_wo_outproj() below)
+    auto build_kqv_outproj_only = [&](ggml_tensor * /*inp_unused*/) -> ggml_tensor * {
 
+        // 1) Q_cur  : [D, H, N] (F32)
+        ggml_tensor * q_cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                                                hp.n_embd_head,  // D
+                                                hp.n_head,       // H
+                                                hp.n_tokens);    // N
+        ggml_set_name(q_cur, "q_cur"); // 랜덤 init은 initialize_tensors(ctx)에서 수행
+
+        // 2) 마스크  : [L, N, 1] (F16)
+        //    - L = hp.n_kv = n_past + n_tokens  (prefill이면 L = N)
+        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                hp.n_kv,         // L
+                                                hp.n_tokens,     // N
+                                                1);
+        ggml_set_name(kq_mask, "mask"); // eval_perf가 여기 이름으로 찾음
+
+        // 3) pos 도 만들어줘야 eval_perf가 안죽음 (실사용 안해도 됨)
+        ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, hp.n_tokens);
+        ggml_set_name(inp_pos, "pos");
+
+        // 4) KV 캐시 버퍼 (F16)
+        //    - view stride 가 n_ctx/embd_gqa 가정이 있으니 기존 계산과 동일하게 확보
+        const int64_t kv_elems_all = (int64_t) hp.n_layer * hp.n_head_kv * hp.n_embd_head * hp.n_ctx;
+        ggml_tensor * k_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+        ggml_tensor * v_l = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv_elems_all);
+        ggml_set_name(k_l, "k_cache");
+        ggml_set_name(v_l, "v_cache");
+
+        // 5) 코어 호출 (내부에서 softmax + AV + Wo 까지 수행)
+        //    - scale = 1/sqrt(D)
+        ggml_tensor * out = llm_build_kqv_modified_wo_outproj(ctx, k_l, v_l, q_cur, kq_mask,
+                                                1.0f/std::sqrt((float)hp.n_embd_head));
+        ggml_set_name(out, "kqv_core_out");
+        return out;
+    };
+
+    // KQV (with outprojection. see llm_build_kqv_modified() below)
+    auto build_kqv_only = [&](ggml_tensor * ) -> ggml_tensor * {
         // 1) Q_cur  : [D, H, N] (F32)
         ggml_tensor * q_cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                                                 hp.n_embd_head,  // D
@@ -5485,6 +5670,7 @@ struct test_attention : public test_llm {
                                                 1.0f/std::sqrt((float)hp.n_embd_head));
         ggml_set_name(out, "kqv_core_out");
         return out;
+
     };
 
     // QKV projection
@@ -5527,15 +5713,57 @@ struct test_attention : public test_llm {
         return out;
     };
 
+    // Attention out-projection only: [E, N] -> [E, N]  (W_o: [E, E])
+    auto build_attn_outproj_only = [&](ggml_tensor * inp) -> ggml_tensor * {
+        ggml_tensor * w_o = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0,
+                                            hp.n_embd, // E
+                                            hp.n_embd  // E
+        );
+        ggml_set_name(w_o, "wo_only");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, w_o, inp);
+        ggml_set_name(out, "attn_outproj_only");
+
+        return out; // [E, N]
+    };
+
+    // LM head only: [E, N] -> logits [V, N]  (W_lm: [E, V])
+    auto build_lm_head_only = [&](ggml_tensor * inp) -> ggml_tensor * {
+        // RMSNorm?
+        // ggml_tensor * out_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+        // ggml_set_name(out_norm_w, "out_norm_w");
+        // inp = llm_build_norm(ctx, inp, out_norm_w, nullptr, LLM_NORM_RMS);
+        // ggml_set_name(inp, "out_norm");
+
+        ggml_tensor * w_lm = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0,
+                                                hp.n_embd,   // E
+                                                hp.n_vocab); // V
+        ggml_set_name(w_lm, "lm_head");
+
+        ggml_tensor * logits = ggml_mul_mat(ctx, w_lm, inp);
+        ggml_set_name(logits, "logits");
+
+        return logits; // [V, N]
+    };
+
+
+
     if (subgraph == Subgraph::AttentionOnly) {
         cur = build_attention_only(cur);
     } else if (subgraph == Subgraph::FFNOnly) {
         cur = build_ffn_only(cur);
+    } else if (subgraph == Subgraph::KQVOutprojOnly){
+        cur = build_kqv_outproj_only(cur);
     } else if (subgraph == Subgraph::KQVOnly) {
         cur = build_kqv_only(cur);
     } else if (subgraph == Subgraph::QKVProj) {
         cur = build_qkv_only(cur);
-    } else {
+    } else if (subgraph == Subgraph::OutProj){
+        cur = build_attn_outproj_only(cur);
+    } else if (subgraph == Subgraph::LMHead){
+        cur = build_lm_head_only(cur);
+    }
+    else {
         cur = build_attention_only(cur);
         cur = build_ffn_only(cur);
     }
@@ -6657,8 +6885,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     Subgraph sg = Subgraph::AttentionOnly;
     if (glob_subgraph == 1) sg = Subgraph::FFNOnly;
     else if (glob_subgraph == 2) sg = Subgraph::AttentionThenFFN;
-    else if (glob_subgraph == 3) sg = Subgraph::KQVOnly;
-    else if (glob_subgraph == 4) sg = Subgraph::QKVProj;
+    else if (glob_subgraph == 3) sg = Subgraph::KQVOutprojOnly;
+    else if (glob_subgraph == 4) sg = Subgraph::KQVOnly;
+    else if (glob_subgraph == 5) sg = Subgraph::QKVProj;
+    else if (glob_subgraph == 6) sg = Subgraph::OutProj;
+    else if (glob_subgraph == 7) sg = Subgraph::LMHead;
 
     // These default params creates same environment as LLAMA3-3.2B-Instruct Q8
     test_cases.emplace_back(new test_attention( 
@@ -6852,19 +7083,27 @@ int main(int argc, char ** argv) {
                 op_names_filter = argv[++i];
                 // ★ ATTENTION일 때, 이어지는 key=value 들을 파싱
                 if (strcmp(op_names_filter, "ATTENTION") == 0 || strcmp(op_names_filter, "FFN") == 0 ||
-                    strcmp(op_names_filter, "ATTN_FFN") == 0 || strcmp(op_names_filter, "KQV") == 0 ||
-                    strcmp(op_names_filter, "QKVPROJ") == 0) {
+                    strcmp(op_names_filter, "ATTN_FFN") == 0 || strcmp(op_names_filter, "KQVONLY") == 0 ||
+                    strcmp(op_names_filter, "QKVPROJ") == 0 || strcmp(op_names_filter, "LMHEAD") == 0 ||
+                    strcmp(op_names_filter, "OUTPROJ") == 0 || strcmp(op_names_filter, "KQVOUTPROJ") == 0) {
                     {                            
                         if (strcmp(op_names_filter, "ATTENTION") == 0) {
                             glob_subgraph = 0;
-                        }else if (strcmp(op_names_filter, "KQV") == 0){
-                            glob_subgraph = 3;
-                        }else if (strcmp(op_names_filter, "QKVPROJ") == 0){
-                            glob_subgraph = 4;
                         }else if (strcmp(op_names_filter, "FFN") == 0) {
                             glob_subgraph = 1;
-                        } else {
-                            std::cout << "OP PARSING ERROR.. -o [OP] should be one of ATTENTION, KQV, QKVPROJ, FFN" << "\n";
+                        }else if (strcmp(op_names_filter, "KQVOUTPROJ") == 0){ // kqv with out projection
+                            glob_subgraph = 3;
+                        }else if (strcmp(op_names_filter, "KQVONLY") == 0){  // kqv without out projection
+                            glob_subgraph = 4;
+                        }else if (strcmp(op_names_filter, "QKVPROJ") == 0){
+                            glob_subgraph = 5;
+                        }else if (strcmp(op_names_filter, "OUTPROJ") == 0){ // only out projection
+                            glob_subgraph = 6;
+                        }else if (strcmp(op_names_filter, "LMHEAD") == 0){ // only LM head
+                            glob_subgraph = 7;
+                        }
+                         else {
+                            std::cout << "OP PARSING ERROR.. -o [OP] should be one of ATTENTION, KQV, QKVPROJ, FFN,,, see code line 7077" << "\n";
                             exit(-1);
                         } 
                         
