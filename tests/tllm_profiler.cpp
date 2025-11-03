@@ -1711,7 +1711,7 @@ struct test_case {
             const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
 
             bytes_per_run = bytes_w_wo + bytes_Q + bytes_out + bytes_read_K + bytes_read_V;
-        }else if (current_op_name == "KQV") { // KQV without out projection (KQVONLY)
+        }else if (current_op_name == "KQVONLY") { // KQV without out projection (KQVONLY)
             // KQV 전용 닫힌형 (간단 버전)
             const double dE = (double)E;
             const double dH = (double)H;
@@ -5460,7 +5460,7 @@ struct test_attention : public test_llm {
             case Subgraph::AttentionOnly:    return "ATTENTION";
             case Subgraph::FFNOnly:          return "FFN";
             case Subgraph::KQVOutprojOnly: return "KQVOUTPROJ";
-            case Subgraph::KQVOnly: return "KQV"; 
+            case Subgraph::KQVOnly: return "KQVONLY"; 
             case Subgraph::QKVProj: return "QKVPROJ";
             case Subgraph::AttentionThenFFN: return "ATTN_FFN"; // 둘 다일 때 구분용
             case Subgraph::OutProj: return "OUTPROJ";
@@ -5637,6 +5637,7 @@ struct test_attention : public test_llm {
 
     // KQV (with outprojection. see llm_build_kqv_modified() below)
     auto build_kqv_only = [&](ggml_tensor * ) -> ggml_tensor * {
+        std::cout << "build_kqv_only" << "\n";
         // 1) Q_cur  : [D, H, N] (F32)
         ggml_tensor * q_cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                                                 hp.n_embd_head,  // D
