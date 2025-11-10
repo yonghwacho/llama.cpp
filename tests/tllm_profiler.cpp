@@ -83,7 +83,7 @@ static inline AttnCost estimate_attention_cost_closed_form_runtime(
     static constexpr bool INCLUDE_WEIGHT_BYTES      = true;
     // 어텐션에서 K/V를 길이 L만큼 "스트리밍 read"한다고 보고 Bytes에 넣을지 (기본: 미포함)
     //   - 커널/캐시 정책에 따라 편차가 커서 기본은 최소 근사(미포함)로 둡니다.
-    static constexpr bool INCLUDE_KV_STREAM_READS   = false;
+    static constexpr bool INCLUDE_KV_STREAM_READS   = true;
 
     // 방어
     if (E <= 0 || H <= 0 || Hkv <= 0 || N <= 0 || L <= 0) {
@@ -1706,7 +1706,7 @@ struct test_case {
             const double bytes_out    = dE * dN * bA;
 
             // (옵션) K/V 스트리밍 read 포함
-            const bool INCLUDE_KV_STREAM_READS = false; // KQV만 볼 때는 보통 포함하는 게 직관적
+            const bool INCLUDE_KV_STREAM_READS = true; // KQV만 볼 때는 보통 포함하는 게 직관적
             const double bytes_read_K = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
             const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
 
@@ -1731,7 +1731,7 @@ struct test_case {
             const double bytes_Q      = dH * dD * dN * bA;   // 이미 RoPE된 Q
 
             // (옵션) K/V 스트리밍 read 포함
-            const bool INCLUDE_KV_STREAM_READS = false; // KQV만 볼 때는 보통 포함하는 게 직관적
+            const bool INCLUDE_KV_STREAM_READS = true; // KQV만 볼 때는 보통 포함하는 게 직관적
             const double bytes_read_K = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
             const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
 
