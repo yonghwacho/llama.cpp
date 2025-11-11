@@ -48,18 +48,19 @@ void pareto_prune(Group& g) {
         if (A.latency != B.latency) return A.latency < B.latency;
         return A.energy < B.energy;
     });
-    
+    // Remove dominated points
+    // After sorting by latency ascending, we keep points with strictly decreasing energy
+    // This forms the Pareto frontier: no point is dominated by another
     vector<Choice> keep;
-    for (size_t i = 0; i < v.size(); ++i) {
-        bool is_dom = false;
-        while (!keep.empty() && keep.back().energy >= v[i].energy - 1e-12) {
-            if (keep.back().latency <= v[i].latency + 1e-12) {
-                keep.pop_back(); // v[i] strictly better energy at equal or higher latency
-            } else break;
+    keep.push_back(v[0]); // Always keep the fastest point
+    
+    for (size_t i = 1; i < v.size(); ++i) {
+        // Only keep v[i] if it has strictly lower energy than the last kept point
+        // Since latency is increasing (sorted), we need energy to decrease to be non-dominated
+        if (v[i].energy < keep.back().energy - 1e-12) {
+            keep.push_back(v[i]);
         }
-        
-        if (!keep.empty() && dominated(v[i], keep.back())) is_dom = true;
-        if (!is_dom) keep.push_back(v[i]);
+        // Otherwise v[i] is dominated: it has higher latency and equal/higher energy
     }
     v.swap(keep);
 }
@@ -107,8 +108,8 @@ DPResult solve_mckp_dp(vector<Group> groups,
         double baseT = groups[g].repeat * C[0].latency;
         double baseE = groups[g].repeat * C[0].energy;
         for (size_t j=0; j<C.size(); ++j) {
-            double dT = groups[g].repeat * (C[j].latency - baseT);
-            double dE = groups[g].repeat * (baseE - C[j].energy); // energy saved vs fastest
+            double dT = groups[g].repeat * C[j].latency - baseT;
+            double dE = baseE - groups[g].repeat * C[j].energy; // energy saved vs fastest
             long long ww = (long long) floor(max(0.0, dT) / time_unit + 1e-9);
             w[g].push_back(ww);
             v[g].push_back(max(0.0, dE));
@@ -184,6 +185,10 @@ DPResult solve_mckp_greedy(vector<Group> groups, double T_budget) {
         T += groups[g].repeat * groups[g].choices[0].latency;
         E += groups[g].repeat * groups[g].choices[0].energy;
     }
+
+    double max_E = E;
+    double min_T = T;
+
     if (T > T_budget + 1e-12) {
         DPResult r; r.feasible=false; r.totalLatency=T; r.totalEnergy=E; return r;
     }
@@ -233,8 +238,8 @@ DPResult solve_mckp_greedy(vector<Group> groups, double T_budget) {
     r.pickIndexPerGroup = cur;
     r.totalLatency = T;
     r.totalEnergy = E;
-    r.energySaved = 0.0; // not tracked here
-    r.slackUsed = (T - 0.0); // not baseline-based here; kept simple
+    r.energySaved = max_E - E; // not tracked here
+    r.slackUsed = T - min_T; // not baseline-based here; kept simple
     return r;
 }
 
