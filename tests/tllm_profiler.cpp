@@ -1661,7 +1661,7 @@ struct test_case {
         if (current_op_name == "ATTENTION") {
             AttnCost a = estimate_attention_cost_closed_form_runtime(
                 E, H, Hkv, N, L,
-                GGML_TYPE_Q8_0,   // wq/wk/wv/wo (그래프에서 Q8_0로 생성했음)
+                GGML_TYPE_F16,   // wq/wk/wv/wo (그래프에서 Q8_0로 생성했음)
                 act_ty,           // activations
                 GGML_TYPE_F16     // KV cache
             );
@@ -1679,7 +1679,7 @@ struct test_case {
 
             FFNCost f = estimate_ffn_cost_closed_form_runtime(
                 E, F, N,
-                (w_up ? w_up->type : GGML_TYPE_Q8_0),  // 실제 weight dtype 선호
+                (w_up ? w_up->type : GGML_TYPE_F16),  // 실제 weight dtype 선호
                 act_ty
             );
             flops_per_run = f.flops;
@@ -1697,7 +1697,7 @@ struct test_case {
             const double fl_wo  = 2.0 * dE * dE * dN;
             flops_per_run = fl_qkt + fl_av + fl_wo;
 
-            const int bW  = bpp_ggml_type(GGML_TYPE_Q8_0);
+            const int bW  = bpp_ggml_type(GGML_TYPE_F16);
             const int bA  = bpp_ggml_type(GGML_TYPE_F32);
             const int bKV = bpp_ggml_type(GGML_TYPE_F16);
 
@@ -1723,7 +1723,7 @@ struct test_case {
             const double fl_av  = 2.0 * dH * dN * dL * dD;
             flops_per_run = fl_qkt + fl_av;
 
-            const int bW  = bpp_ggml_type(GGML_TYPE_Q8_0);
+            const int bW  = bpp_ggml_type(GGML_TYPE_F16);
             const int bA  = bpp_ggml_type(GGML_TYPE_F32);
             const int bKV = bpp_ggml_type(GGML_TYPE_F16);
 
@@ -1748,9 +1748,9 @@ struct test_case {
             ggml_tensor * wq = ggml_get_tensor(ctx.get(), "wq");
             ggml_tensor * wk = ggml_get_tensor(ctx.get(), "wk");
             ggml_tensor * wv = ggml_get_tensor(ctx.get(), "wv");
-            const ggml_type w_ty_q = wq ? wq->type : GGML_TYPE_Q8_0;
-            const ggml_type w_ty_k = wk ? wk->type : GGML_TYPE_Q8_0;
-            const ggml_type w_ty_v = wv ? wv->type : GGML_TYPE_Q8_0;
+            const ggml_type w_ty_q = wq ? wq->type : GGML_TYPE_F16;
+            const ggml_type w_ty_k = wk ? wk->type : GGML_TYPE_F16;
+            const ggml_type w_ty_v = wv ? wv->type : GGML_TYPE_F16;
 
             const int bWq = bpp_ggml_type(w_ty_q);
             const int bWk = bpp_ggml_type(w_ty_k);
@@ -1794,7 +1794,7 @@ struct test_case {
             // Bytes ≈ W_lm read + X read + logits write  (최소 근사, softmax 제외)
             ggml_tensor * w_lm = ggml_get_tensor(ctx.get(), "lm_head");
             const int    V     = w_lm ? (int) w_lm->ne[1] : (int)glob_n_vocab; // [E,V]에서 V는 ne[1]
-            const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_Q8_0;
+            const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_F16;
 
             const double dE = (double) E;
             const double dV = (double) V;
@@ -1824,7 +1824,7 @@ struct test_case {
             // FLOPs = 2 * E * E * N
             // Bytes ≈ W_o read + Y read + out write  (최소 근사)
             ggml_tensor * w_o = ggml_get_tensor(ctx.get(), "wo_only");
-            const ggml_type w_ty = w_o ? w_o->type : GGML_TYPE_Q8_0;
+            const ggml_type w_ty = w_o ? w_o->type : GGML_TYPE_F16;
 
             const double dE = (double) E;
             const double dN = (double) N;
@@ -5153,7 +5153,7 @@ public:
 
         struct ggml_tensor * cur = ggml_cont_2d(ctx, kqv_merged, hp.n_embd_head*hp.n_head, hp.n_tokens);
 
-        struct ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
+        struct ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd);
         cur = ggml_mul_mat(ctx, wo, cur);
 
         return cur;
@@ -5219,7 +5219,7 @@ public:
         struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
         struct ggml_tensor * cur        = ggml_cont_2d(ctx, kqv_merged, hp.n_embd_head * hp.n_head, hp.n_tokens);
 
-        struct ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
+        struct ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd);
         cur = ggml_mul_mat(ctx, wo, cur);
 
         return cur;
@@ -5572,10 +5572,10 @@ struct test_attention : public test_llm {
 
     // Attention subgraph
     auto build_attention_only = [&](ggml_tensor * inp) -> ggml_tensor * {
-        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
-        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
-        ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
-        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd);
         ggml_set_name(wq, "wq"); ggml_set_name(wk, "wk"); ggml_set_name(wv, "wv"); ggml_set_name(wo, "wo");
 
         ggml_tensor * Q = ggml_mul_mat(ctx, wq, inp); ggml_set_name(Q, "Q_mm");
@@ -5678,9 +5678,9 @@ struct test_attention : public test_llm {
     auto build_qkv_only = [&](ggml_tensor * inp) -> ggml_tensor * {
 
         // 가중치
-        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd);
-        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
-        ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd_gqa());
+        ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd_gqa());
         ggml_set_name(wq, "wq"); ggml_set_name(wk, "wk"); ggml_set_name(wv, "wv");
 
         // Q/K/V 투영
@@ -5701,9 +5701,9 @@ struct test_attention : public test_llm {
 
     // FFN subgraph
     auto build_ffn_only = [&](ggml_tensor * inp) -> ggml_tensor * {
-        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_ff);
-        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_ff);
-        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_ff,   hp.n_embd);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_ff);
+        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_ff);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_ff,   hp.n_embd);
         ggml_set_name(w_up, "w_up"); ggml_set_name(w_gate, "w_gate"); ggml_set_name(w_down, "w_down");
 
         ggml_tensor * up    = ggml_mul_mat(ctx, w_up,   inp); ggml_set_name(up,   "ffn_up");
@@ -5716,7 +5716,7 @@ struct test_attention : public test_llm {
 
     // Attention out-projection only: [E, N] -> [E, N]  (W_o: [E, E])
     auto build_attn_outproj_only = [&](ggml_tensor * inp) -> ggml_tensor * {
-        ggml_tensor * w_o = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0,
+        ggml_tensor * w_o = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
                                             hp.n_embd, // E
                                             hp.n_embd  // E
         );
@@ -5736,7 +5736,7 @@ struct test_attention : public test_llm {
         // inp = llm_build_norm(ctx, inp, out_norm_w, nullptr, LLM_NORM_RMS);
         // ggml_set_name(inp, "out_norm");
 
-        ggml_tensor * w_lm = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0,
+        ggml_tensor * w_lm = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
                                                 hp.n_embd,   // E
                                                 hp.n_vocab); // V
         ggml_set_name(w_lm, "lm_head");
@@ -5836,7 +5836,7 @@ struct test_falcon : public test_llm {
             {
                 cur = attn_norm;
 
-                ggml_tensor * wqkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd + 2*hp.n_embd_gqa());
+                ggml_tensor * wqkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_embd + 2*hp.n_embd_gqa());
 
                 cur = ggml_mul_mat(ctx, wqkv, cur);
 
@@ -5867,8 +5867,8 @@ struct test_falcon : public test_llm {
 
             // feed forward
             {
-                ggml_tensor * ffn_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_ff);
-                ggml_tensor * ffn_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_ff, hp.n_embd);
+                ggml_tensor * ffn_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_ff);
+                ggml_tensor * ffn_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_ff, hp.n_embd);
                 cur = attn_norm;
                 cur = ggml_mul_mat(ctx, ffn_up, cur);
                 cur = ggml_gelu(ctx, cur);
@@ -5890,7 +5890,7 @@ struct test_falcon : public test_llm {
         cur = llm_build_norm(ctx, cur, output_norm, output_norm_b, LLM_NORM);
 
         // lm_head
-        ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hp.n_embd, hp.n_vocab);
+        ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.n_embd, hp.n_vocab);
         cur = ggml_mul_mat(ctx, output, cur);
 
         return cur;
@@ -5919,8 +5919,8 @@ static const ggml_type all_types[] = {
 // Minsung modified
 static const ggml_type tllm_types[] = {
     // GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
-    GGML_TYPE_Q8_0,
-    // GGML_TYPE_F16, GGML_TYPE_Q8_0,
+    //GGML_TYPE_Q8_0,
+    GGML_TYPE_F16, GGML_TYPE_Q8_0,
 };
 
 static const ggml_type base_types[] = {
