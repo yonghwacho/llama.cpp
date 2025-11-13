@@ -1818,8 +1818,7 @@ struct test_case {
 
             // fprintf(stderr, "[lmhead-cost] E=%d V=%d N=%d :: flops=%.3e bytes(MB)=%.2f\n",
             //         E, V, N, fl, bytes/1e6);
-        }
-        else if (current_op_name == "OUTPROJ") {
+        } else if (current_op_name == "OUTPROJ") {
             // out = W_o[E, E] * Y[E, N] -> [E, N]
             // FLOPs = 2 * E * E * N
             // Bytes ≈ W_o read + Y read + out write  (최소 근사)
@@ -1847,6 +1846,72 @@ struct test_case {
 
             // fprintf(stderr, "[outproj-cost] E=%d N=%d :: flops=%.3e bytes(MB)=%.2f\n",
             //         E, N, fl, bytes/1e6);
+        } else if (current_op_name == "GROUP2") {
+            //
+            // 1) ATTENTION (QKV + KQ^T V + Wo)
+            //
+            AttnCost a = estimate_attention_cost_closed_form_runtime(
+                E, H, Hkv, N, L,
+                GGML_TYPE_Q8_0,   // wq/wk/wv/wo (그래프에서 Q8_0로 생성했음)
+                act_ty,           // activations dtype
+                GGML_TYPE_F16     // KV cache dtype
+            );
+
+            //
+            // 2) FFN
+            //    - 기존 FFN 분기와 동일하게 F를 텐서에서 추출
+            //
+            ggml_tensor * w_up = ggml_get_tensor(ctx.get(), "w_up");
+            ggml_tensor * w_dn = ggml_get_tensor(ctx.get(), "w_down");
+            int F = 0;
+            if (w_up)      F = (int) w_up->ne[1];   // [E, F]
+            else if (w_dn) F = (int) w_dn->ne[0];   // [F, E]
+            else           F = (int) (E * 4);       // fallback
+
+            FFNCost f = estimate_ffn_cost_closed_form_runtime(
+                E, F, N,
+                (w_up ? w_up->type : GGML_TYPE_Q8_0),  // 실제 weight dtype 선호
+                act_ty
+            );
+
+            //
+            // 3) LMHEAD
+            //    - 기존 "LMHEAD" 분기와 동일한 로직 재사용
+            //
+            ggml_tensor * w_lm = ggml_get_tensor(ctx.get(), "lm_head");
+            const int    V     = w_lm ? (int) w_lm->ne[1]
+                                      : (int) glob_n_vocab; // [E, V]에서 V는 ne[1]
+            const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_Q8_0;
+
+            const double dE = (double) E;
+            const double dV = (double) V;
+            const double dN = (double) N;
+
+            // FLOPs (logits = W_lm[E, V] * X[E, N] -> [V, N])
+            const double fl_lm = 2.0 * dE * dV * dN;
+
+            // Bytes
+            static constexpr bool INCLUDE_WEIGHT_BYTES_LM = true;
+            const int bW_lm = bpp_ggml_type(w_ty);
+            const int bA    = bpp_ggml_type(act_ty);
+
+            const double bytes_w_lm = dE * dV * bW_lm;   // W_lm
+            const double bytes_x_lm = dE * dN * bA;      // X (input to lm head)
+            const double bytes_y_lm = dV * dN * bA;      // logits
+            const double bytes_lm   =
+                (INCLUDE_WEIGHT_BYTES_LM ? bytes_w_lm : 0.0) + bytes_x_lm + bytes_y_lm;
+
+            //
+            // 4) 최종 합산
+            //
+            flops_per_run  = a.flops + f.flops + fl_lm;
+            bytes_per_run  = a.bytes + f.bytes + bytes_lm;
+
+            // fprintf(stderr,
+            //   "[qkv_attn_ffn_lmhead] N=%d :: flops=%.3e(a=%.3e, f=%.3e, lm=%.3e) bytes(MB)=%.2f(a=%.2f, f=%.2f, lm=%.2f)\n",
+            //   N,
+            //   flops_per_run, a.flops, f.flops, fl_lm,
+            //   bytes_per_run/1e6, a.bytes/1e6, f.bytes/1e6, bytes_lm/1e6);
         }else {
             flops_per_run = 0.0;
             bytes_per_run = std::max<double>(ggml_nbytes(out), 1);
@@ -5440,6 +5505,7 @@ enum class Subgraph {
     QKVProj,
     OutProj,
     LMHead,
+    QKVAttnFFNLMHead,
 };
 
 
@@ -5465,6 +5531,7 @@ struct test_attention : public test_llm {
             case Subgraph::AttentionThenFFN: return "ATTN_FFN"; // 둘 다일 때 구분용
             case Subgraph::OutProj: return "OUTPROJ";
             case Subgraph::LMHead: return "LMHEAD";
+            case Subgraph::QKVAttnFFNLMHead: return "GROUP2";
         }
         return "ATTENTION";
     }
@@ -5504,7 +5571,8 @@ struct test_attention : public test_llm {
                                 glob_subgraph == 4 ? "kqv"  :
                                 glob_subgraph == 5 ? "qkv"  :
                                 glob_subgraph == 6 ? "outproj"  :
-                                glob_subgraph == 7 ? "lmhead"  : "???"
+                                glob_subgraph == 7 ? "lmhead"  : 
+                                glob_subgraph == 8 ? "GROUP2 (QKVAttnFFNLMHead)" : "???"
                                 );
         std::cout 
                     << "Creating [" << sg_name << "] compute graph n_vocab="    << glob_n_vocab
@@ -5747,6 +5815,25 @@ struct test_attention : public test_llm {
         return logits; // [V, N]
     };
 
+        // QKV + Attention(outproj) + FFN + LMHead 
+    auto build_qkv_attn_ffn_lmhead_only = [&](ggml_tensor * inp) -> ggml_tensor * {
+        ggml_tensor * cur = inp;
+
+        // 1) Attention 전체 (QKV proj + RoPE + KV store + KQ^T V + Wo)
+        cur = build_attention_only(cur);      // [E, N]
+        ggml_set_name(cur, "attn_full_out");
+
+        // 2) FFN (up + gate + activation + down)
+        cur = build_ffn_only(cur);            // [E, N]
+        ggml_set_name(cur, "ffn_full_out");
+
+        // 3) LM Head (E -> V logits)
+        cur = build_lm_head_only(cur);        // [V, N]
+        ggml_set_name(cur, "qkv_attn_ffn_lmhead_out");
+
+        return cur;
+    };
+
 
 
     if (subgraph == Subgraph::AttentionOnly) {
@@ -5763,6 +5850,8 @@ struct test_attention : public test_llm {
         cur = build_attn_outproj_only(cur);
     } else if (subgraph == Subgraph::LMHead){
         cur = build_lm_head_only(cur);
+    } else if (subgraph == Subgraph::QKVAttnFFNLMHead){
+        cur = build_qkv_attn_ffn_lmhead_only(cur);
     }
     else {
         cur = build_attention_only(cur);
@@ -6891,7 +6980,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     else if (glob_subgraph == 5) sg = Subgraph::QKVProj;
     else if (glob_subgraph == 6) sg = Subgraph::OutProj;
     else if (glob_subgraph == 7) sg = Subgraph::LMHead;
-
+    else if (glob_subgraph == 8) sg = Subgraph::QKVAttnFFNLMHead; 
+    
+    
     // These default params creates same environment as LLAMA3-3.2B-Instruct Q8
     test_cases.emplace_back(new test_attention( 
         /*n_tokens=*/glob_n_tokens,
@@ -7086,7 +7177,8 @@ int main(int argc, char ** argv) {
                 if (strcmp(op_names_filter, "ATTENTION") == 0 || strcmp(op_names_filter, "FFN") == 0 ||
                     strcmp(op_names_filter, "ATTN_FFN") == 0 || strcmp(op_names_filter, "KQVONLY") == 0 ||
                     strcmp(op_names_filter, "QKVPROJ") == 0 || strcmp(op_names_filter, "LMHEAD") == 0 ||
-                    strcmp(op_names_filter, "OUTPROJ") == 0 || strcmp(op_names_filter, "KQVOUTPROJ") == 0) {
+                    strcmp(op_names_filter, "OUTPROJ") == 0 || strcmp(op_names_filter, "KQVOUTPROJ") == 0 ||
+                    strcmp(op_names_filter, "GROUP2") == 0) {
                     {                            
                         if (strcmp(op_names_filter, "ATTENTION") == 0) {
                             glob_subgraph = 0;
@@ -7102,6 +7194,8 @@ int main(int argc, char ** argv) {
                             glob_subgraph = 6;
                         }else if (strcmp(op_names_filter, "LMHEAD") == 0){ // only LM head
                             glob_subgraph = 7;
+                        }else if (strcmp(op_names_filter, "GROUP2") == 0){
+                            glob_subgraph = 8;
                         }
                          else {
                             std::cout << "OP PARSING ERROR.. -o [OP] should be one of ATTENTION, KQV, QKVPROJ, FFN,,, see code line 7077" << "\n";
