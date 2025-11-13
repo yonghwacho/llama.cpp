@@ -75,16 +75,16 @@ DPResult solve_mckp_dp(vector<Group> groups,
     int G = (int)groups.size();
     for (auto &g : groups) pareto_prune(g);
 
-    for (auto &g: groups) {
-        // print items after prune
-        cout << "Group [" << g.name << "] after Pareto prune (" << g.choices.size() << " choices):\n";
-        for (size_t i = 0; i < g.choices.size(); ++i) {
-            const auto &ch = g.choices[i];
-            cout << "  #" << i << ": energy=" << ch.energy << ", latency=" << ch.latency
-                 << " (c=" << ch.c << ", m=" << ch.m << ", tag=" << ch.tag << ")\n";
-        }
-    }
-    printf("\n");
+    // for (auto &g: groups) {
+    //     // print items after prune
+    //     cout << "Group [" << g.name << "] after Pareto prune (" << g.choices.size() << " choices):\n";
+    //     for (size_t i = 0; i < g.choices.size(); ++i) {
+    //         const auto &ch = g.choices[i];
+    //         cout << "  #" << i << ": energy=" << ch.energy << ", latency=" << ch.latency
+    //              << " (c=" << ch.c << ", m=" << ch.m << ", tag=" << ch.tag << ")\n";
+    //     }
+    // }
+    // printf("\n");
 
     // Build baseline (fastest option per group = smallest latency)
     vector<int> baseIdx(G, -1);
@@ -155,7 +155,7 @@ DPResult solve_mckp_dp(vector<Group> groups,
         if (dp[G][curW] > bestVal) { bestVal = dp[G][curW]; bestW = curW; }
     }
 
-    std::cout << "bestW = " << bestW << ", bestVal = " << bestVal << std::endl;
+    // std::cout << "bestW = " << bestW << ", bestVal = " << bestVal << std::endl;
 
     DPResult res;
     if (bestVal <= INF_NEG/2) {
