@@ -5349,6 +5349,28 @@ public:
         return kqv;
     }
 
+    // inp: [E, N] (head 합쳐진 attention output)
+    struct ggml_tensor * llm_build_outproj_only(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * inp  // [E, N]
+    ) {
+        // W_o: [E, E]
+        struct ggml_tensor * wo = ggml_new_tensor_2d(
+            ctx,
+            GGML_TYPE_F16,
+            hp.n_embd,  // rows: E
+            hp.n_embd   // cols: E
+        );
+        ggml_set_name(wo, "wo_only");
+
+        // out = W_o * inp  -> [E, N]
+        struct ggml_tensor * out = ggml_mul_mat(ctx, wo, inp);
+        ggml_set_name(out, "attn_outproj_only");
+
+        return out;
+    }
+
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -5364,6 +5386,8 @@ public:
         }
     }
 };
+
+
 
 // Llama
 // Minsung Note:
@@ -5818,9 +5842,11 @@ struct test_attention : public test_llm {
         // QKV + Attention(outproj) + FFN + LMHead 
     auto build_qkv_attn_ffn_lmhead_only = [&](ggml_tensor * inp) -> ggml_tensor * {
         ggml_tensor * cur = inp;
+        cur = build_qkv_only(cur);
+        ggml_set_name(cur, "qkv_proj_out");
 
         // 1) Attention 전체 (QKV proj + RoPE + KV store + KQ^T V + Wo)
-        cur = build_attention_only(cur);      // [E, N]
+        cur = llm_build_outproj_only(ctx, cur);      // [E, N]
         ggml_set_name(cur, "attn_full_out");
 
         // 2) FFN (up + gate + activation + down)
