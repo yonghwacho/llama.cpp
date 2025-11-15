@@ -1,281 +1,535 @@
+// arithmetic_intensity.cpp
 #include "arithmetic_intensity.h"
 #include "ggml.h"
-#include "ggml-impl.h"   
-#include "freq_ai_policy.h"
+#include "ggml-impl.h"
 #include "ggml-dvfs.h"
 
-#include <cstdio>
-#include <cstdint>
-#include <array>
-#include <atomic>
-#include <csignal>
-#include <cstring> 
-#include "roofline_select.h"
+#include "roofline_select.h"   // build_freq_candidates_for_group
 #include "perf_frame.h"
-#include "selector.h"
+#include "selector.h"          // build_choices_for_mckp, g_em (extern)
 #include "roofline_pred.h"
 #include "energy_model.h"
+#include "ggml-mckp-freq.h"
 
-// 전역 또는 static 설정(보정값은 보드에 맞춰 튠)
-static RooflineCaps g_caps{ 1.2e12, 30e9 };
-static EnergyModel  g_em{};
-static SelectorCfg  g_scfg{ 1.0 };        // 에너지 최적화
-static RLPolicyCfg  g_rlcfg{};
-static RLSystem     g_rlsys{ 1.0, 1.0, 1.0, 1.0 };
+// llama 내부 타입 정의 필요
+#include "llama-batch.h"   // struct llama_ubatch
+#include "llama-model.h"   // struct llama_model
 
-// ==== EWMA 토글 & 파라미터 ================================================
-// 1: EWMA 사용, 0: 미사용(즉시값)
-#ifndef GGML_AI_USE_EWMA
-#define GGML_AI_USE_EWMA 1
+#include <atomic>
+#include <csignal>
+#include <cstring>
+#include <vector>
+#include <array>
+#include <cstdio>
+#include <cstdint>
+#include <algorithm>
+
+// ──────────────────────────────────────────────
+// DVFS 그룹 ID (커널 쪽과 맞추면 더 좋고, 일단 0/1/2 가정)
+//   - 0: ATTENTION_CORE (QK^T + AV = KQVONLY)
+//   - 1: PROJ+FFN       (QKV proj + Wo + FFN)
+//   - 2: LMHEAD
+// ──────────────────────────────────────────────
+#ifndef GGML_DVFS_GRP_ATT_CORE
+#define GGML_DVFS_GRP_ATT_CORE   0
 #endif
-// EWMA 알파 (0.0~1.0), 높을수록 최근값 가중↑
-#ifndef GGML_AI_EWMA_ALPHA
-#define GGML_AI_EWMA_ALPHA 0.20
-#endif
-// ==========================================================================
 
-std::atomic<bool> probe_requested{true};
-// 프로브 요청 API
+#ifndef GGML_DVFS_GRP_MID
+#define GGML_DVFS_GRP_MID        1
+#endif
+
+#ifndef GGML_DVFS_GRP_LM
+#define GGML_DVFS_GRP_LM         2
+#endif
+
+// ──────────────────────────────────────────────
+// probe 플래그 + API
+// ──────────────────────────────────────────────
+static std::atomic<bool> probe_requested{true};
+
 inline void request_probe() {
     probe_requested.store(true);
 }
 
-// 그래프 분석 호출 함수
-void ggml_analyze_arithmetic_intensity(const ggml_cgraph * graph);
-
-// maybe_probe_api: 외부 요청이 있을 때만 AI 계산 실행
-void maybe_probe_ai(const ggml_cgraph * graph);
-
-// null-safe strstr 래퍼 (프로토타입 또는 inline 정의)
-static inline bool has(const char* s, const char* pat);
-
-// 노드명 기반 그룹 추론 (프로토타입)
-static int infer_group_from_node(const ggml_tensor* dst);
-
-// Op별 통계 정보
-struct OpStats {
-    double flops_per_elem;
-    int    n_src;
-    bool   writes_dst;
+// ──────────────────────────────────────────────
+// 그룹별 집계용
+//   - Group 0: ATTENTION_CORE (KQVONLY: QK^T + AV)
+//   - Group 1: PROJ+FFN       (Q/K/V proj + Wo proj + FFN)
+//   - Group 2: LMHEAD         (logits projection)
+// PerfFrame.group 은
+//   - G_KQV    : Group1
+//   - G_OTHER  : Group2
+//   - G_LMHEAD : Group3
+// ──────────────────────────────────────────────
+struct GroupAgg {
+    int      gid   = -1;   // DVFS 그룹 ID (위 매크로)
+    bool     active = false;
+    PerfFrame frame{};
 };
 
-static std::array<OpStats, GGML_OP_COUNT> op_stats = [](){
-    std::array<OpStats, GGML_OP_COUNT> a;
-    // 기본값 채우기
-    for(auto & s : a){
-        s = { 0.0, /*n_src=*/0, /*writes_dst=*/false };
+// 그룹 3개
+static GroupAgg g_groups[3] = {
+    { GGML_DVFS_GRP_ATT_CORE, false, {} },  // Group1: KQVONLY core
+    { GGML_DVFS_GRP_MID,      false, {} },  // Group2: QKV proj + Wo + FFN
+    { GGML_DVFS_GRP_LM,       false, {} },  // Group3: LM Head
+};
+
+static GroupAgg * find_group_agg(int gid) {
+    for (auto & g : g_groups) {
+        if (g.gid == gid) return &g;
     }
-    // 필요한 연산자만 덮어쓰기
-    a[GGML_OP_ADD]       = { 1.0, 2, true  };
-    a[GGML_OP_MUL]       = { 1.0, 2, true  };
-    a[GGML_OP_RMS_NORM]  = { 2.0, 1, true  };
-    a[GGML_OP_MUL_MAT]   = { 0.0, 2, true  }; // flops_per_elem 런타임 재계산
-    a[GGML_OP_CPY]       = { 0.0, 1, true  };
-    a[GGML_OP_CONT]      = { 0.0, 1, true  };
-    a[GGML_OP_RESHAPE]   = { 0.0, 1, false };
-    a[GGML_OP_VIEW]      = { 0.0, 1, false };
-    a[GGML_OP_PERMUTE]   = { 0.0, 1, false };
-    a[GGML_OP_TRANSPOSE] = { 0.0, 1, false };
-    a[GGML_OP_SOFT_MAX]  = { 3.0, 1, true  };
-    a[GGML_OP_ROPE]      = { 2.0, 2, true  };
-    a[GGML_OP_GLU]       = { 2.0, 2, true  };
-    // … 추가가 필요하면 여기에 더 …
-    return a;
-}();
-
-// ──────────────────────────────────────────────────────────────
-// 정책(decider) + (옵션) op별 EWMA 상태
-// ──────────────────────────────────────────────────────────────
-static FreqDecision g_decider;
-
-#if GGML_AI_USE_EWMA
-struct OpAgg { double ewma_ai = 0.0; bool init = false; };
-static std::array<OpAgg, GGML_OP_COUNT> g_op_ai;
-#endif
-
-static inline double ewma(double prev, double x, double alpha) {
-    return prev * (1.0 - alpha) + x * alpha;
+    return nullptr;
 }
 
-// 최초 1회 정책 초기화 (device caps/정책은 실제 값으로 교체 권장)
-static void ensure_decider_initialized() {
-    static bool inited = false;
-    if (inited) return;
-    inited = true;
-
-    RooflineCaps caps{
-        /*peak_flops=*/1.2e12,  // TODO: system-data-profiler 실측치 입력
-        /*peak_bw=*/   30e9     // TODO: system-data-profiler 실측치 입력
-    };
-    PolicyConfig cfg{};
-    // 필요시 cfg.low_margin / high_margin / cooldown_us 등 조정
-    g_decider.configure(caps, cfg);
-
-    // 초기 스냅샷(온도/배터리/쿼리 길이 등은 외부에서 주기적으로 업데이트 가능)
-    g_decider.update_system(SystemSnapshot{.therm_scale=1.0, .batt_scale=1.0});
-    g_decider.update_query (QueryContext{.predicted_len_tokens=-1, .latency_budget_ms=-1});
-
-    // RL 훅 사용 시 set_rl_hook(...) 등록
-    g_decider.set_rl_hook(nullptr);
-    rl_configure(g_caps, g_rlcfg);
-    rl_set_system(g_rlsys);
+// ──────────────────────────────────────────────
+// helper: 타입 별 바이트 수 (rough)
+// ──────────────────────────────────────────────
+static inline int bpp_ggml_type(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return 4;
+        case GGML_TYPE_F16:  return 2;
+        case GGML_TYPE_Q8_0: return 1;
+        case GGML_TYPE_Q4_0: return 1;
+        default:             return 4;
+    }
 }
 
-// 외부에서 시스템/쿼리 스냅샷 갱신
-void ggml_freq_policy_update_system(const SystemSnapshot& s) { ensure_decider_initialized(); g_decider.update_system(s); }
-void ggml_freq_policy_update_query (const QueryContext&   q) { ensure_decider_initialized(); g_decider.update_query(q);  }
+// PREFILL / DECODE 판별: n_tokens 기준 (요구사항)
+static ggml_stage infer_stage_from_ubatch(const llama_ubatch & ubatch) {
+    return (ubatch.n_tokens > 1) ? ST_PREFILL : ST_DECODE;
+}
 
-// ──────────────────────────────────────────────────────────────
-// 메인: 그래프 노드들을 훑어 AI(FLOPs/Bytes) 계산 + 정책 호출
-// ──────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────
+// Closed-form 비용 모델
+//   - Attention core(KQVONLY): QK^T + AV → Group1
+//   - Q/K/V projection + Wo proj         → Group2 (ProjCost)
+//   - FFN                                → Group2
+//   - LMHead                             → Group3
+// ──────────────────────────────────────────────
 
-void ggml_analyze_arithmetic_intensity(const ggml_cgraph * graph) {
-    ensure_decider_initialized();
-    double total_flops  = 0.0;
-    double total_bytes  = 0.0;
+// 1) Attention core = KQVONLY (QK^T + AV 만)
+struct AttnCoreCost {
+    double flops;
+    double bytes;
+};
 
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * dst  = graph->nodes[i];
-        OpStats stats            = op_stats[dst->op];
+static inline AttnCoreCost estimate_attention_core_layer(
+    int E, int H, int Hkv,
+    int N,     // tokens per batch (ubatch.n_tokens)
+    int L,     // KV context length
+    ggml_type act_type, ggml_type kv_type
+) {
+    const double dE   = (double) E;
+    const double dH   = (double) H;
+    const double dHkv = (double) Hkv;
+    const double dD   = dE / dH;      // head_dim
+    const double dN   = (double) N;
+    const double dL   = (double) L;
 
-        /* --- FLOPs ---------------------------------------------------- */
-        double flops = 0.0;
-        if (dst->op == GGML_OP_MUL_MAT) {
-            const ggml_tensor * A = dst->src[0];
-            const ggml_tensor * B = dst->src[1];
-            int64_t M = dst->ne[0];           // row
-            int64_t N = dst->ne[1];           // col
-            int64_t K = A->ne[0];             // 공통 차원 (A row == K)
-            flops = 2.0 * (double)M * N * K;  // 2*M*N*K
-        } else {
-            flops = stats.flops_per_elem * ggml_nelements(dst);
-        }
+    // FLOPs: QK^T + AV
+    const double fl_qkt = 2.0 * dH * dN * dL * dD;  // QK^T
+    const double fl_av  = 2.0 * dH * dN * dL * dD;  // AV
+    const double flops_total = fl_qkt + fl_av;
 
-        /* --- Bytes ---------------------------------------------------- */
-        double bytes = 0.0;
-        for (int si = 0; si < stats.n_src; ++si) {
-            bytes += ggml_nbytes(dst->src[si]);   // 입력별 실제 바이트
-        }
-        if (stats.writes_dst) {
-            bytes += ggml_nbytes(dst);
-        }
+    const int bA  = bpp_ggml_type(act_type); // 보통 F32
+    const int bKV = bpp_ggml_type(kv_type);  // 보통 F16
 
-        /* --- 출력 ---------------------------------------------------- */
-        double ai = bytes ? flops / bytes : 0.0;  // divide-by-zero guard
+    // Q: [H, D, N]
+    const double bytes_Q = dH * dD * dN * bA;
 
-        // === EWMA 토글: 정책에 넘길 AI 결정 ===
-#if GGML_AI_USE_EWMA
-        auto &agg = g_op_ai[dst->op];
-        if (!agg.init) { agg.ewma_ai = ai; agg.init = true; }
-        else           { agg.ewma_ai = ewma(agg.ewma_ai, ai, GGML_AI_EWMA_ALPHA); }
-        const double ai_for_policy = agg.ewma_ai;
-#else
-        const double ai_for_policy = ai;   // 즉시값 사용
-#endif
+    // KV 스트리밍 read
+    const double dim_kv        = (dE / dH) * dHkv;  // (E/H) * Hkv
+    const double bytes_read_K  = dim_kv * dL * bKV;
+    const double bytes_read_V  = dim_kv * dL * bKV;
 
-        // 1) 그룹 판별
-        const int gid = infer_group_from_node(dst);
+    const double bytes_total = bytes_Q + bytes_read_K + bytes_read_V;
 
-        // 2) 스킵 대상이면 DVFS 관련 호출을 건너뛰고 통계/로그만 계속
-        if (gid == GGML_DVFS_GRP_SKIP) {
-            // (원하면 여기서도 printf는 계속)
-            printf("[skip dvfs] node[%2d] name=\"%s\" op=%d  AI=%.2f\n",
-                i, dst->name ? dst->name : "(null)", dst->op, ai);
-            total_flops += flops;
-            total_bytes += bytes;
-            continue; // DVFS는 스킵
-        }
+    AttnCoreCost ac{};
+    ac.flops = flops_total;
+    ac.bytes = bytes_total;
+    return ac;
+}
 
-        // 3) 정책 호출 (★gid를 op_id 대신 넘겨 같은 그룹=같은 의사결정)
-        PerfFrame f{};
-        f.group = (ggml_group)gid;
-        f.flops = flops;
-        f.bytes = bytes;
-        f.ai    = (bytes > 0.0) ? (flops / bytes) : 0.0;
+// 2) Q/K/V projection + Wo projection per-layer → Group2
+struct ProjCost {
+    double flops;
+    double bytes;
+};
 
-        // (원하면 컨텍스트 메타 채우기: 레이어/토큰 등)
-        // f.layer = /* layer index if known */;
-        // f.token_id = /* decode step */;
-        // f.stage = Stage::DECODE; // or PREFILL
+static inline ProjCost estimate_proj_cost_layer(
+    int E, int H, int Hkv,
+    int N,
+    ggml_type wtype
+) {
+    const double dE   = (double) E;
+    const double dH   = (double) H;
+    const double dHkv = (double) Hkv;
+    const double dD   = dE / dH;
+    const double dN   = (double) N;
 
-        // 4-1) 이번 스텝용 후보를 Roofline 규칙으로 생성
+    // FLOPs
+    const double fl_q  = 2.0 * dE * dE * dN;              // Q proj
+    const double fl_kv = 2.0 * 2.0 * dE * (dD * dHkv) * dN; // K+V proj
+    const double fl_wo = 2.0 * dE * dE * dN;              // Wo proj
+
+    const double flops_total = fl_q + fl_kv + fl_wo;
+
+    // Weights만 고려 (rough)
+    const int bW = bpp_ggml_type(wtype);
+    const double bytes_wq = dE * dE * bW;
+    const double bytes_wk = dE * (dD * dHkv) * bW;
+    const double bytes_wv = dE * (dD * dHkv) * bW;
+    const double bytes_wo = dE * dE * bW;
+    const double bytes_total = bytes_wq + bytes_wk + bytes_wv + bytes_wo;
+
+    ProjCost pc{};
+    pc.flops = flops_total;
+    pc.bytes = bytes_total;
+    return pc;
+}
+
+// 3) FFN per-layer
+struct FFNCost {
+    double flops;
+    double bytes;
+};
+
+static inline FFNCost estimate_ffn_cost_layer(
+    int E, int F, int N,
+    ggml_type wtype, ggml_type act_type
+) {
+    const double dE = (double) E;
+    const double dF = (double) F;
+    const double dN = (double) N;
+
+    // FLOPs (한 레이어 기준)
+    const double fl_up    = 2.0 * dF * dN * dE;
+    const double fl_gate  = 2.0 * dF * dN * dE;
+    const double fl_silu  = 4.0 * dF * dN;      // activation
+    const double fl_fused = 1.0 * dF * dN;      // elementwise
+    const double fl_down  = 2.0 * dE * dN * dF;
+
+    const double flops_total = fl_up + fl_gate + fl_silu + fl_fused + fl_down;
+
+    // Bytes (러프)
+    const int bW = bpp_ggml_type(wtype);
+    const int bA = bpp_ggml_type(act_type);
+
+    const double bytes_w_up   = dE * dF * bW;
+    const double bytes_w_gate = dE * dF * bW;
+    const double bytes_w_down = dF * dE * bW;
+
+    const double bytes_X     = dE * dN * bA;
+    const double bytes_up    = dF * dN * bA;
+    const double bytes_gate  = dF * dN * bA;
+    const double bytes_fused = dF * dN * bA;
+    const double bytes_out   = dE * dN * bA;
+
+    const double bytes_total = (bytes_w_up + bytes_w_gate + bytes_w_down) +
+        (bytes_X + bytes_up + bytes_gate + bytes_fused + bytes_out);
+
+    return { flops_total, bytes_total };
+}
+
+// 4) LM Head (한 번만, Group3)
+static inline void estimate_lmhead_cost(
+    int E, int V, int N,
+    ggml_type wtype, ggml_type act_type,
+    double & flops_out,
+    double & bytes_out
+) {
+    const double dE = (double) E;
+    const double dV = (double) V;
+    const double dN = (double) N;
+
+    const double fl = 2.0 * dE * dV * dN;  // [V,E] * [E,N]
+    const int bW = bpp_ggml_type(wtype);
+    const int bA = bpp_ggml_type(act_type);
+
+    const double bytes_w = dE * dV * bW;
+    const double bytes_x = dE * dN * bA;
+    const double bytes_y = dV * dN * bA;
+
+    flops_out = fl;
+    bytes_out = bytes_w + bytes_x + bytes_y;
+}
+
+// ──────────────────────────────────────────────
+// 메인 분석 함수
+// ──────────────────────────────────────────────
+void ggml_analyze_arithmetic_intensity(
+    const ggml_cgraph * graph,   // 지금은 안 씀
+    const llama_ubatch & ubatch,
+    const llama_model  & model) {
+
+    GGML_UNUSED(graph); // 안 쓰는 파라미터 워닝 제거
+
+    const auto & hp = model.hparams;
+
+    const int n_embd    = (int) hp.n_embd;
+    const int n_head    = (int) hp.n_head();
+    const int n_head_kv = (int) hp.n_head_kv();
+    const int n_ff      = (int) hp.n_ff();
+    const int n_layer   = (int) hp.n_layer;
+
+    const int n_vocab   = (int) model.vocab.n_tokens();
+    const int n_tokens  = (int) ubatch.n_tokens;
+
+    // KV 길이 추정: decode의 경우 pos 최대값 + 1, prefill이면 대략 n_tokens
+    int n_ctx = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        n_ctx = std::max(n_ctx, (int) ubatch.pos[i] + 1);
+    }
+    if (n_ctx == 0) {
+        n_ctx = n_tokens;
+    }
+
+    if (n_tokens <= 0 || n_embd <= 0 || n_layer <= 0) {
+        printf("[AI] invalid hparams: n_tokens=%d, n_embd=%d, n_layer=%d\n",
+               n_tokens, n_embd, n_layer);
+        return;
+    }
+
+    ggml_stage stage = infer_stage_from_ubatch(ubatch);
+    printf("[AI] stage=%s, n_tokens=%d, n_ctx=%d\n",
+           stage == ST_PREFILL ? "PREFILL" : "DECODE",
+           n_tokens, n_ctx);
+
+    printf("[AI] params: n_layer=%d, n_embd=%d, n_head=%d, n_head_kv=%d, "
+           "n_ff=%d, n_vocab=%d, n_tokens=%d, n_ctx=%d\n",
+           n_layer, n_embd, n_head, n_head_kv, n_ff, n_vocab, n_tokens, n_ctx);
+
+    // ──────────────────────────────────────────────
+    // 그룹 초기화 (+ stage 세팅)
+    // ──────────────────────────────────────────────
+    for (auto & g : g_groups) {
+        g.active = false;
+        g.frame  = {};        // zero-init
+        g.frame.stage = stage;
+    }
+
+    double total_flops = 0.0;
+    double total_bytes = 0.0;
+
+    // 1) Attention core (KQVONLY = QK^T + AV) → Group1
+    AttnCoreCost att_core = estimate_attention_core_layer(
+        n_embd,
+        n_head,
+        n_head_kv,
+        n_tokens,
+        n_ctx,
+        GGML_TYPE_F32,   // activations
+        GGML_TYPE_F16    // KV cache
+    );
+
+    GroupAgg * g_att = find_group_agg(GGML_DVFS_GRP_ATT_CORE);
+    if (g_att) {
+        g_att->active        = true;
+        g_att->frame.group   = G_KQV;  // PerfFrame용 논리 그룹
+        g_att->frame.flops   = att_core.flops * n_layer;
+        g_att->frame.bytes   = att_core.bytes * n_layer;
+        g_att->frame.ai      = g_att->frame.bytes > 0.0
+                                 ? g_att->frame.flops / g_att->frame.bytes
+                                 : 0.0;
+        total_flops += g_att->frame.flops;
+        total_bytes += g_att->frame.bytes;
+    }
+
+    // 2) Proj(Q/K/V, Wo) + FFN → Group2
+    ProjCost proj_layer = estimate_proj_cost_layer(
+        n_embd,
+        n_head,
+        n_head_kv,
+        n_tokens,
+        GGML_TYPE_F16   // proj weights
+    );
+
+    FFNCost ffn_layer = estimate_ffn_cost_layer(
+        n_embd,
+        n_ff,
+        n_tokens,
+        GGML_TYPE_Q8_0,  // FFN weights
+        GGML_TYPE_F32    // activations
+    );
+
+    GroupAgg * g_mid = find_group_agg(GGML_DVFS_GRP_MID);
+    if (g_mid) {
+        g_mid->active        = true;
+        g_mid->frame.group   = G_OTHER;  // Proj + FFN
+        g_mid->frame.flops   = (proj_layer.flops + ffn_layer.flops) * n_layer;
+        g_mid->frame.bytes   = (proj_layer.bytes + ffn_layer.bytes) * n_layer;
+        g_mid->frame.ai      = g_mid->frame.bytes > 0.0
+                                 ? g_mid->frame.flops / g_mid->frame.bytes
+                                 : 0.0;
+        total_flops += g_mid->frame.flops;
+        total_bytes += g_mid->frame.bytes;
+    }
+
+    // 3) LM Head → Group3
+    double fl_lm    = 0.0;
+    double bytes_lm = 0.0;
+    estimate_lmhead_cost(
+        n_embd,
+        n_vocab,
+        n_tokens,
+        GGML_TYPE_Q8_0,   // lm_head weight
+        GGML_TYPE_F32,    // activations
+        fl_lm,
+        bytes_lm
+    );
+
+    GroupAgg * g_lm = find_group_agg(GGML_DVFS_GRP_LM);
+    if (g_lm) {
+        g_lm->active        = true;
+        g_lm->frame.group   = G_LMHEAD;
+        g_lm->frame.flops   = fl_lm;   // 한 번만
+        g_lm->frame.bytes   = bytes_lm;
+        g_lm->frame.ai      = g_lm->frame.bytes > 0.0
+                                ? g_lm->frame.flops / g_lm->frame.bytes
+                                : 0.0;
+        total_flops += g_lm->frame.flops;
+        total_bytes += g_lm->frame.bytes;
+    }
+
+    // 그룹별 로그
+    for (auto & g : g_groups) {
+        if (!g.active) continue;
+
+        const char * gname = "UNKNOWN";
+        if (g.gid == GGML_DVFS_GRP_ATT_CORE) gname = "KQV_CORE(QK^T+AV)";
+        else if (g.gid == GGML_DVFS_GRP_MID) gname = "PROJ+FFN";
+        else if (g.gid == GGML_DVFS_GRP_LM)  gname = "LMHEAD";
+
+        printf("[AI] Group %s: FLOP=%.0f  Bytes=%.0f  AI=%.6f\n",
+               gname, g.frame.flops, g.frame.bytes, g.frame.ai);
+    }
+
+    // ──────────────────────────────────────────────
+    // MCKP용 GroupC/ChoiceC 구성
+    // ──────────────────────────────────────────────
+    std::vector<GroupC>               groups_c;
+    std::vector<std::vector<ChoiceC>> choices_storage;
+    std::vector<int>                  gid_list;
+
+    for (auto & g : g_groups) {
+        if (!g.active || g.frame.bytes <= 0.0) continue;
+
         FreqCandidates cand{};
-        rl_build_candidates(f, g_caps, g_rlcfg, cand);
+        build_freq_candidates_for_group(g.gid, cand);
 
-        // 4-2) 그 후보만 평가하여 최적 조합 선택
-        Decision d = select_with_energy(f, g_caps, g_em, g_scfg, cand);
+        auto choices = build_choices_for_mckp(g.frame, g_em, cand);
+        if (choices.empty()) continue;
 
+        choices_storage.emplace_back(std::move(choices));
 
-        // (선택) 예측치 디버깅
-        f.t_pred_ms = predict_latency_ms(f, d.cpu_khz, d.mem_khz, g_caps);
-        f.e_pred_j  = predict_power_w(g_em, f.group, d.cpu_khz, d.mem_khz, f.ai) * (f.t_pred_ms / 1e3);
+        GroupC gc{};
+        gc.name      = nullptr;
+        gc.repeat    = 1;                            // 토큰당 1번
+        gc.n_choices = choices_storage.back().size();
+        gc.choices   = choices_storage.back().data();
 
-        // ── 목표 기록 + 즉시 적용 ─────────────────────────────────────
-        ggml_dvfs_set    (gid, d.cpu_khz);
-        ggml_memfreq_set (gid, d.mem_khz);
-        ggml_dvfs_apply_if_needed(gid);   // ← 바로 sysfs 반영(값이 바뀐 경우만)
-
-        // 로깅
-        printf("[dvfs gid=%d] node[%2d] name=\"%s\" cpu=%d kHz mem=%d kHz  AI=%.2f  t_pred=%.2fms  e_pred=%.3fJ\n",
-            gid, i, dst->name ? dst->name : "(null)",
-            d.cpu_khz, d.mem_khz, f.ai, f.t_pred_ms, f.e_pred_j);
-
-        total_flops  += flops;
-        total_bytes  += bytes;
+        groups_c.push_back(gc);
+        gid_list.push_back(g.gid);
     }
 
-    double total_ai = total_bytes ? total_flops / total_bytes : 0.0;
-    printf("=== TOTAL:  FLOP=%0.f  Bytes=%0.f  AI=%0.2f ===\n",
+    if (groups_c.empty()) {
+        printf("[mckp] no active group, skip\n");
+        double total_ai = total_bytes > 0.0 ? total_flops / total_bytes : 0.0;
+        printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
+               total_flops, total_bytes, total_ai);
+        return;
+    }
+
+    // ──────────────────────────────────────────────
+    // T_budget 설정
+    //   - PREFILL : baseline + 10% slack
+    //   - DECODE  : 300 ms 고정
+    // ──────────────────────────────────────────────
+    double T_min = 0.0;
+    for (const auto & gc : groups_c) {
+        if (gc.n_choices == 0) continue;
+        double best = 1e300;
+        for (size_t j = 0; j < gc.n_choices; ++j) {
+            best = std::min(best, gc.choices[j].latency);
+        }
+        T_min += best * gc.repeat;
+    }
+
+    const double slack_ratio      = 0.10;
+    const double T_budget_prefill = T_min * (1.0 + slack_ratio);
+
+    double T_budget;
+    if (stage == ST_PREFILL) {
+        T_budget = T_budget_prefill;
+    } else { // ST_DECODE 등
+        T_budget = 300.0;   // ms
+    }
+
+    const double time_unit = 0.1;   // 0.1ms resolution
+
+    DPResultC res = freq_table_mckp_solver_c(
+        groups_c.data(),
+        groups_c.size(),
+        T_budget,
+        time_unit,
+        /*use_dp=*/true
+    );
+
+    if (!res.feasible) {
+        printf("[mckp] infeasible, fallback to baseline\n");
+        free_dpresult_c(&res);
+        double total_ai = total_bytes > 0.0 ? total_flops / total_bytes : 0.0;
+        printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
+               total_flops, total_bytes, total_ai);
+        return;
+    }
+
+    // ──────────────────────────────────────────────
+    // MCKP 결과 → 그룹별 freq 적용
+    // ──────────────────────────────────────────────
+    for (size_t gi = 0; gi < groups_c.size(); ++gi) {
+        int idx = res.selected_index_per_group
+                  ? res.selected_index_per_group[gi]
+                  : 0;
+        if (idx < 0 || (size_t) idx >= groups_c[gi].n_choices) {
+            idx = 0;
+        }
+
+        const ChoiceC & ch = groups_c[gi].choices[idx];
+
+        int cpu_khz = ch.c;
+        int mem_khz = ch.m;
+        int gid     = gid_list[gi];
+
+        ggml_dvfs_set    (gid, cpu_khz);
+        ggml_memfreq_set (gid, mem_khz);
+        ggml_dvfs_apply_if_needed(gid);
+
+        printf("[mckp dvfs] gid=%d  cpu=%d kHz  mem=%d kHz  (lat=%.3f ms, E=%.3f J)\n",
+               gid, cpu_khz, mem_khz, ch.latency, ch.energy);
+    }
+
+    free_dpresult_c(&res);
+
+    double total_ai = total_bytes > 0.0 ? total_flops / total_bytes : 0.0;
+    printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
            total_flops, total_bytes, total_ai);
 }
 
-
-
-void maybe_probe_ai(const ggml_cgraph * graph) {
-    // 요청 플래그가 false일 경우 아무 작업 없이 반환
+// ──────────────────────────────────────────────
+// maybe_probe / signal
+// ──────────────────────────────────────────────
+void maybe_probe_ai(
+    const ggml_cgraph * graph,
+    const llama_ubatch & ubatch,
+    const llama_model  & model
+) {
     if (!probe_requested.exchange(false)) {
         return;
     }
-    ggml_analyze_arithmetic_intensity(graph);
+    ggml_analyze_arithmetic_intensity(graph, ubatch, model);
 }
 
 void setup_probe_signal() {
     std::signal(SIGUSR1, [](int){ probe_requested.store(true); });
-}
-
-// null-safe strstr 래퍼
-static inline bool has(const char* s, const char* pat) {
-    return s && std::strstr(s, pat);
-}
-
-// node name 기반으로 DVFS 그룹 추론
-static int infer_group_from_node(const ggml_tensor* dst) {
-    const char* nm = dst->name ? dst->name : "";
-
-    // ---- Attention 계열 ----
-    // Q/K/V, reshape/permute/transpose 포함, KV cache view/copy/permuted 포함
-    if (has(nm, "Qcur") || has(nm, "Kcur") || has(nm, "Vcur") ||
-        has(nm, "kqv_out") || has(nm, "attn_out") ||
-        has(nm, "cache_k_") || has(nm, "cache_v_") ||           // cache_k_l4, cache_v_l4...
-        has(nm, "(reshaped)") || has(nm, "(permuted)") || has(nm, "(transposed)")) {
-        return GGML_DVFS_GRP_ATTN;
-    }
-
-    // ---- FFN 계열 ----
-    // gate/up/down proj, swiglu 등
-    if (has(nm, "ffn_") || has(nm, "swiglu") ||
-        has(nm, "ffn_up") || has(nm, "ffn_down") || has(nm, "ffn_gate")) {
-        return GGML_DVFS_GRP_FFN;
-    }
-
-    // ---- Norm 계열 ----
-    if (has(nm, "norm-") || has(nm, "attn_norm") || has(nm, "ffn_norm")) {
-        return GGML_DVFS_GRP_NORM;
-    }
-
-    // (원하면 임베딩/입출력 등도 추가)
-    // if (has(nm, "embed")) return GGML_DVFS_GRP_EMB;
-
-    // 나머지
-    return GGML_DVFS_GRP_MISC;
 }

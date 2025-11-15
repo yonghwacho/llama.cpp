@@ -211,9 +211,18 @@ add_library(ggml-base STATIC
             arithmetic_intensity.cpp
             freq_ai_policy.cpp
             roofline_select.cpp
+            ggml-cpu/ggml-mckp-dvfs.cpp
+            ggml-cpu/selector.cpp
             )
 
-target_include_directories(ggml-base PRIVATE .)
+target_include_directories(ggml-base
+    PRIVATE
+        .                                       # ggml/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/..          # ggml
+        ${CMAKE_SOURCE_DIR}/include             # 루트/include  (llama.h 위치)
+        ${CMAKE_SOURCE_DIR}/src                 # 루트/src      (llama-batch.h, llama-model.h)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include  # ggml/include (있으면 같이 사용)
+)
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()

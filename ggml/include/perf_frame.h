@@ -2,15 +2,30 @@
 #pragma once
 #include <cstdint>
 
-enum ggml_stage   : uint8_t { ST_PREFILL=0, ST_DECODE=1 };
-enum ggml_group   : uint8_t { G_ATTN=0, G_FFN=1, G_NORM=2, G_MISC=3, GGML_G_COUNT=4 };
+// 프리필 / 디코드 스테이지
+enum ggml_stage : uint8_t {
+    ST_PREFILL = 0,
+    ST_DECODE  = 1,
+    GGML_STAGE_COUNT
+};
+
+// DVFS/에너지 모델에서 쓸 *논리* 그룹
+//  - G_KQV    : QK^V core (QK^T + AV)
+//  - G_OTHER  : QKV proj + Attention out proj + FFN
+//  - G_LMHEAD : LM head
+enum perf_group : uint8_t {
+    G_KQV    = 0,
+    G_OTHER  = 1,
+    G_LMHEAD = 2,
+    PERF_G_COUNT
+};
 
 struct PerfFrame {
   // 식별
-  uint32_t token_id = 0xFFFFFFFF;
-  uint16_t layer    = 0xFFFF;
-  ggml_stage stage  = ST_DECODE;
-  ggml_group group  = G_MISC;
+  uint32_t   token_id = 0xFFFFFFFF;
+  uint16_t   layer    = 0xFFFF;
+  ggml_stage stage    = ST_DECODE;
+  perf_group group    = G_OTHER;
 
   // 작업 양
   double flops = 0.0;   // [FLOP]
@@ -22,8 +37,8 @@ struct PerfFrame {
   uint32_t freq_mem_khz  = 0;
 
   // 예측 결과(선택기가 채움)
-  double t_pred_ms = 0.0; // Latency, Energy array
-  double e_pred_j  = 0.0; // SLO
+  double t_pred_ms = 0.0; // Latency
+  double e_pred_j  = 0.0; // Energy
 
   // 메타 (디버그/로그용)
   uint64_t ts_ns = 0;

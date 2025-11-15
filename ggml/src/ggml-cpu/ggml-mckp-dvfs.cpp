@@ -3,7 +3,15 @@ wjbang, 10.27
 MCKP-based DVFS controller Implementation
 */
 
-#include <bits/stdc++.h>
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
 #include "ggml-mckp-freq.h"
 #include <cstdlib>
 #include <string>
