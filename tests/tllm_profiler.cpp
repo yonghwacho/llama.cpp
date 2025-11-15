@@ -1848,19 +1848,90 @@ struct test_case {
             //         E, N, fl, bytes/1e6);
         } else if (current_op_name == "GROUP2") {
             //
-            // 1) ATTENTION (QKV + KQ^T V + Wo)
+            {
+            // 1) ATTENTION (QKV)
             //
-            AttnCost a = estimate_attention_cost_closed_form_runtime(
-                E, H, Hkv, N, L,
-                GGML_TYPE_Q8_0,   // wq/wk/wv/wo (그래프에서 Q8_0로 생성했음)
-                act_ty,           // activations dtype
-                GGML_TYPE_F16     // KV cache dtype
-            );
+            const double dE  = (double) E;
+            const double dH  = (double) H;
+            const double dD  = dE / dH;           // = E/H
+            const double dHk = (double) Hkv;
+            const double dN  = (double) N;
+
+            // 가중치 dtype/활성 dtype은 실제 텐서에서 우선 취득 (없으면 기본값)
+            ggml_tensor * wq = ggml_get_tensor(ctx.get(), "wq");
+            ggml_tensor * wk = ggml_get_tensor(ctx.get(), "wk");
+            ggml_tensor * wv = ggml_get_tensor(ctx.get(), "wv");
+            const ggml_type w_ty_q = wq ? wq->type : GGML_TYPE_F16;
+            const ggml_type w_ty_k = wk ? wk->type : GGML_TYPE_F16;
+            const ggml_type w_ty_v = wv ? wv->type : GGML_TYPE_F16;
+
+            const int bWq = bpp_ggml_type(w_ty_q);
+            const int bWk = bpp_ggml_type(w_ty_k);
+            const int bWv = bpp_ggml_type(w_ty_v);
+            const int bA  = bpp_ggml_type(act_ty); // activations
+
+            // ── FLOPs (2*M*N*K):
+            // Q: 2*E*E*N
+            const double fl_q  = 2.0 * dE * dE * dN;
+            // K: 2*E*(D*Hkv)*N
+            const double fl_k  = 2.0 * dE * (dD * dHk) * dN;
+            // V: same as K
+            const double fl_v  = fl_k;
+
+            flops_per_run = fl_q + fl_k + fl_v;
+
+            // ── Bytes:
+            // (옵션) 가중치 1-pass read 포함
+            static constexpr bool INCLUDE_WEIGHT_BYTES = true;
+            const double bytes_wq = dE * dE            * bWq;
+            const double bytes_wk = dE * (dD * dHk)    * bWk;
+            const double bytes_wv = dE * (dD * dHk)    * bWv;
+            const double weight_bytes = INCLUDE_WEIGHT_BYTES ? (bytes_wq + bytes_wk + bytes_wv) : 0.0;
+
+            // 활성: X read + (Q/K/V materialize) write (최소 근사, 1-pass)
+            const double bytes_X = dE * dN * bA;
+            const double bytes_Q = (dH * dD)  * dN * bA;   // = E * N
+            const double bytes_K = (dHk*dD)  * dN * bA;   // = (E/H*Hkv) * N
+            const double bytes_V = (dHk*dD)  * dN * bA;
+
+            bytes_per_run = weight_bytes + (bytes_X + bytes_Q + bytes_K + bytes_V);
+            }
+
+            {
+            // 2) out projection
+            // out = W_o[E, E] * Y[E, N] -> [E, N]
+            // FLOPs = 2 * E * E * N
+            // Bytes ≈ W_o read + Y read + out write  (최소 근사)
+            ggml_tensor * w_o = ggml_get_tensor(ctx.get(), "wo_only");
+            const ggml_type w_ty = w_o ? w_o->type : GGML_TYPE_F16;
+
+            const double dE = (double) E;
+            const double dN = (double) N;
+
+            // FLOPs
+            const double fl = 2.0 * dE * dE * dN;
+
+            // Bytes
+            static constexpr bool INCLUDE_WEIGHT_BYTES = true;
+            const int bW = bpp_ggml_type(w_ty);
+            const int bA = bpp_ggml_type(act_ty);
+
+            const double bytes_w  = dE * dE * bW;   // W_o
+            const double bytes_x  = dE * dN * bA;   // input activations
+            const double bytes_y  = dE * dN * bA;   // output activations
+            const double bytes    = (INCLUDE_WEIGHT_BYTES ? bytes_w : 0.0) + bytes_x + bytes_y;
+
+            flops_per_run += fl;
+            bytes_per_run += bytes;            
+            }
+
+
 
             //
             // 2) FFN
             //    - 기존 FFN 분기와 동일하게 F를 텐서에서 추출
             //
+            {
             ggml_tensor * w_up = ggml_get_tensor(ctx.get(), "w_up");
             ggml_tensor * w_dn = ggml_get_tensor(ctx.get(), "w_down");
             int F = 0;
@@ -1873,42 +1944,10 @@ struct test_case {
                 (w_up ? w_up->type : GGML_TYPE_Q8_0),  // 실제 weight dtype 선호
                 act_ty
             );
-
-            //
-            // 3) LMHEAD
-            //    - 기존 "LMHEAD" 분기와 동일한 로직 재사용
-            //
-            // ggml_tensor * w_lm = ggml_get_tensor(ctx.get(), "lm_head");
-            // const int    V     = w_lm ? (int) w_lm->ne[1]
-            //                           : (int) glob_n_vocab; // [E, V]에서 V는 ne[1]
-            // const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_Q8_0;
-
-            // const double dE = (double) E;
-            // const double dV = (double) V;
-            // const double dN = (double) N;
-
-            // // FLOPs (logits = W_lm[E, V] * X[E, N] -> [V, N])
-            // const double fl_lm = 2.0 * dE * dV * dN;
-
-            // // Bytes
-            // static constexpr bool INCLUDE_WEIGHT_BYTES_LM = true;
-            // const int bW_lm = bpp_ggml_type(w_ty);
-            // const int bA    = bpp_ggml_type(act_ty);
-
-            // const double bytes_w_lm = dE * dV * bW_lm;   // W_lm
-            // const double bytes_x_lm = dE * dN * bA;      // X (input to lm head)
-            // const double bytes_y_lm = dV * dN * bA;      // logits
-            // const double bytes_lm   =
-            //     (INCLUDE_WEIGHT_BYTES_LM ? bytes_w_lm : 0.0) + bytes_x_lm + bytes_y_lm;
-
-            //
-            // 4) 최종 합산
-            //
-            // flops_per_run  = a.flops + f.flops + fl_lm;
-            // bytes_per_run  = a.bytes + f.bytes + bytes_lm;
-            flops_per_run  = a.flops + f.flops;
-            bytes_per_run  = a.bytes + f.bytes;
-
+            flops_per_run += f.flops;
+            bytes_per_run += f.bytes;
+            }
+            
             // fprintf(stderr,
             //   "[qkv_attn_ffn_lmhead] N=%d :: flops=%.3e(a=%.3e, f=%.3e, lm=%.3e) bytes(MB)=%.2f(a=%.2f, f=%.2f, lm=%.2f)\n",
             //   N,
