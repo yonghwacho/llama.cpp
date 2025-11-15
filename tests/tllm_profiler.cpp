@@ -1878,34 +1878,36 @@ struct test_case {
             // 3) LMHEAD
             //    - 기존 "LMHEAD" 분기와 동일한 로직 재사용
             //
-            ggml_tensor * w_lm = ggml_get_tensor(ctx.get(), "lm_head");
-            const int    V     = w_lm ? (int) w_lm->ne[1]
-                                      : (int) glob_n_vocab; // [E, V]에서 V는 ne[1]
-            const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_Q8_0;
+            // ggml_tensor * w_lm = ggml_get_tensor(ctx.get(), "lm_head");
+            // const int    V     = w_lm ? (int) w_lm->ne[1]
+            //                           : (int) glob_n_vocab; // [E, V]에서 V는 ne[1]
+            // const ggml_type w_ty = w_lm ? w_lm->type : GGML_TYPE_Q8_0;
 
-            const double dE = (double) E;
-            const double dV = (double) V;
-            const double dN = (double) N;
+            // const double dE = (double) E;
+            // const double dV = (double) V;
+            // const double dN = (double) N;
 
-            // FLOPs (logits = W_lm[E, V] * X[E, N] -> [V, N])
-            const double fl_lm = 2.0 * dE * dV * dN;
+            // // FLOPs (logits = W_lm[E, V] * X[E, N] -> [V, N])
+            // const double fl_lm = 2.0 * dE * dV * dN;
 
-            // Bytes
-            static constexpr bool INCLUDE_WEIGHT_BYTES_LM = true;
-            const int bW_lm = bpp_ggml_type(w_ty);
-            const int bA    = bpp_ggml_type(act_ty);
+            // // Bytes
+            // static constexpr bool INCLUDE_WEIGHT_BYTES_LM = true;
+            // const int bW_lm = bpp_ggml_type(w_ty);
+            // const int bA    = bpp_ggml_type(act_ty);
 
-            const double bytes_w_lm = dE * dV * bW_lm;   // W_lm
-            const double bytes_x_lm = dE * dN * bA;      // X (input to lm head)
-            const double bytes_y_lm = dV * dN * bA;      // logits
-            const double bytes_lm   =
-                (INCLUDE_WEIGHT_BYTES_LM ? bytes_w_lm : 0.0) + bytes_x_lm + bytes_y_lm;
+            // const double bytes_w_lm = dE * dV * bW_lm;   // W_lm
+            // const double bytes_x_lm = dE * dN * bA;      // X (input to lm head)
+            // const double bytes_y_lm = dV * dN * bA;      // logits
+            // const double bytes_lm   =
+            //     (INCLUDE_WEIGHT_BYTES_LM ? bytes_w_lm : 0.0) + bytes_x_lm + bytes_y_lm;
 
             //
             // 4) 최종 합산
             //
-            flops_per_run  = a.flops + f.flops + fl_lm;
-            bytes_per_run  = a.bytes + f.bytes + bytes_lm;
+            // flops_per_run  = a.flops + f.flops + fl_lm;
+            // bytes_per_run  = a.bytes + f.bytes + bytes_lm;
+            flops_per_run  = a.flops + f.flops;
+            bytes_per_run  = a.bytes + f.bytes;
 
             // fprintf(stderr,
             //   "[qkv_attn_ffn_lmhead] N=%d :: flops=%.3e(a=%.3e, f=%.3e, lm=%.3e) bytes(MB)=%.2f(a=%.2f, f=%.2f, lm=%.2f)\n",
@@ -5853,9 +5855,9 @@ struct test_attention : public test_llm {
         cur = build_ffn_only(cur);            // [E, N]
         ggml_set_name(cur, "ffn_full_out");
 
-        // 3) LM Head (E -> V logits)
-        cur = build_lm_head_only(cur);        // [V, N]
-        ggml_set_name(cur, "qkv_attn_ffn_lmhead_out");
+        // // 3) LM Head (E -> V logits)
+        // cur = build_lm_head_only(cur);        // [V, N]
+        // ggml_set_name(cur, "qkv_attn_ffn_lmhead_out");
 
         return cur;
     };
