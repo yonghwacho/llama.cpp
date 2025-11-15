@@ -1941,7 +1941,7 @@ struct test_case {
 
             FFNCost f = estimate_ffn_cost_closed_form_runtime(
                 E, F, N,
-                (w_up ? w_up->type : GGML_TYPE_Q8_0),  // 실제 weight dtype 선호
+                (w_up ? w_up->type : GGML_TYPE_F16),  // 실제 weight dtype 선호
                 act_ty
             );
             flops_per_run += f.flops;
