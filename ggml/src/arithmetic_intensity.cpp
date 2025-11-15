@@ -11,7 +11,7 @@
 #include "energy_model.h"
 #include "ggml-mckp-freq.h"
 
-// llama 내부 타입 정의 필요
+// llama 내부 타입 정의
 #include "llama-batch.h"   // struct llama_ubatch
 #include "llama-model.h"   // struct llama_model
 
@@ -25,7 +25,7 @@
 #include <algorithm>
 
 // ──────────────────────────────────────────────
-// DVFS 그룹 ID (커널 쪽과 맞추면 더 좋고, 일단 0/1/2 가정)
+// DVFS 그룹 ID
 //   - 0: ATTENTION_CORE (QK^T + AV = KQVONLY)
 //   - 1: PROJ+FFN       (QKV proj + Wo + FFN)
 //   - 2: LMHEAD
@@ -62,7 +62,7 @@ inline void request_probe() {
 //   - G_LMHEAD : Group3
 // ──────────────────────────────────────────────
 struct GroupAgg {
-    int      gid   = -1;   // DVFS 그룹 ID (위 매크로)
+    int      gid   = -1;   // DVFS 그룹 ID
     bool     active = false;
     PerfFrame frame{};
 };
@@ -82,7 +82,7 @@ static GroupAgg * find_group_agg(int gid) {
 }
 
 // ──────────────────────────────────────────────
-// helper: 타입 별 바이트 수 (rough)
+// helper: 타입 별 바이트 수
 // ──────────────────────────────────────────────
 static inline int bpp_ggml_type(enum ggml_type t) {
     switch (t) {
@@ -94,17 +94,17 @@ static inline int bpp_ggml_type(enum ggml_type t) {
     }
 }
 
-// PREFILL / DECODE 판별: n_tokens 기준 (요구사항)
+// PREFILL / DECODE 판별: n_tokens 기준
 static ggml_stage infer_stage_from_ubatch(const llama_ubatch & ubatch) {
     return (ubatch.n_tokens > 1) ? ST_PREFILL : ST_DECODE;
 }
 
 // ──────────────────────────────────────────────
 // Closed-form 비용 모델
-//   - Attention core(KQVONLY): QK^T + AV → Group1
-//   - Q/K/V projection + Wo proj         → Group2 (ProjCost)
-//   - FFN                                → Group2
-//   - LMHead                             → Group3
+//   - Group1: Attention core(KQVONLY) = QK^T + AV
+//   - Group2: Q/K/V projection + Wo projection + FFN
+//   - Group3: LMHead
+//   (tllm_profiler와 동일한 구조 / 거의 동일한 수식)
 // ──────────────────────────────────────────────
 
 // 1) Attention core = KQVONLY (QK^T + AV 만)
@@ -113,11 +113,11 @@ struct AttnCoreCost {
     double bytes;
 };
 
-static inline AttnCoreCost estimate_attention_core_layer(
+// tllm_profiler 의 KQVONLY 경량 버전과 동일한 형태
+static inline AttnCoreCost estimate_kqvonly_closed_form(
     int E, int H, int Hkv,
-    int N,     // tokens per batch (ubatch.n_tokens)
-    int L,     // KV context length
-    ggml_type act_type, ggml_type kv_type
+    int N,     // tokens per batch
+    int L      // KV context length
 ) {
     const double dE   = (double) E;
     const double dH   = (double) H;
@@ -127,21 +127,25 @@ static inline AttnCoreCost estimate_attention_core_layer(
     const double dL   = (double) L;
 
     // FLOPs: QK^T + AV
-    const double fl_qkt = 2.0 * dH * dN * dL * dD;  // QK^T
-    const double fl_av  = 2.0 * dH * dN * dL * dD;  // AV
+    //   - QK^T : 2 * H * N * L * D
+    //   - AV   : 2 * H * N * L * D
+    const double fl_qkt = 2.0 * dH * dN * dL * dD;
+    const double fl_av  = 2.0 * dH * dN * dL * dD;
     const double flops_total = fl_qkt + fl_av;
 
-    const int bA  = bpp_ggml_type(act_type); // 보통 F32
-    const int bKV = bpp_ggml_type(kv_type);  // 보통 F16
+    // Bytes:
+    //   - Q activations : [H, D, N]
+    //   - K/V KV cache read : (E/H * Hkv) * L (per K,V) * bKV
+    const int bA  = bpp_ggml_type(GGML_TYPE_F32);  // activations
+    const int bKV = bpp_ggml_type(GGML_TYPE_F16);  // KV cache
 
-    // Q: [H, D, N]
     const double bytes_Q = dH * dD * dN * bA;
 
-    // KV 스트리밍 read
-    const double dim_kv        = (dE / dH) * dHkv;  // (E/H) * Hkv
-    const double bytes_read_K  = dim_kv * dL * bKV;
-    const double bytes_read_V  = dim_kv * dL * bKV;
+    const double dim_kv       = (dE / dH) * dHkv;  // (E/H) * Hkv
+    const double bytes_read_K = dim_kv * dL * bKV;
+    const double bytes_read_V = dim_kv * dL * bKV;
 
+    // Wo weight는 Group2에서만 카운트 (중복 방지)
     const double bytes_total = bytes_Q + bytes_read_K + bytes_read_V;
 
     AttnCoreCost ac{};
@@ -156,7 +160,8 @@ struct ProjCost {
     double bytes;
 };
 
-static inline ProjCost estimate_proj_cost_layer(
+// tllm_profiler 의 GROUP2(QKVPROJ+Wo)와 동일 개념
+static inline ProjCost estimate_qkvproj_closed_form(
     int E, int H, int Hkv,
     int N,
     ggml_type wtype
@@ -164,23 +169,38 @@ static inline ProjCost estimate_proj_cost_layer(
     const double dE   = (double) E;
     const double dH   = (double) H;
     const double dHkv = (double) Hkv;
-    const double dD   = dE / dH;
+    const double dD   = dE / dH;      // head_dim
     const double dN   = (double) N;
 
     // FLOPs
-    const double fl_q  = 2.0 * dE * dE * dN;              // Q proj
-    const double fl_kv = 2.0 * 2.0 * dE * (dD * dHkv) * dN; // K+V proj
-    const double fl_wo = 2.0 * dE * dE * dN;              // Wo proj
+    //   Q : 2 * E * E * N
+    //   K : 2 * E * (D * Hkv) * N
+    //   V : 2 * E * (D * Hkv) * N
+    //   Wo: 2 * E * E * N
+    const double fl_q  = 2.0 * dE * dE * dN;
+    const double fl_k  = 2.0 * dE * (dD * dHkv) * dN;
+    const double fl_v  = fl_k;
+    const double fl_wo = 2.0 * dE * dE * dN;
 
-    const double flops_total = fl_q + fl_kv + fl_wo;
+    const double flops_total = fl_q + fl_k + fl_v + fl_wo;
 
-    // Weights만 고려 (rough)
+    // Bytes (Weights + Activations, tllm_profiler GROUP2와 구조 맞춤)
     const int bW = bpp_ggml_type(wtype);
-    const double bytes_wq = dE * dE * bW;
-    const double bytes_wk = dE * (dD * dHkv) * bW;
-    const double bytes_wv = dE * (dD * dHkv) * bW;
-    const double bytes_wo = dE * dE * bW;
-    const double bytes_total = bytes_wq + bytes_wk + bytes_wv + bytes_wo;
+    const int bA = bpp_ggml_type(GGML_TYPE_F32);
+
+    const double bytes_wq = dE * dE         * bW;
+    const double bytes_wk = dE * (dD*dHkv)  * bW;
+    const double bytes_wv = dE * (dD*dHkv)  * bW;
+    const double bytes_wo = dE * dE         * bW;
+
+    const double bytes_X = dE * dN * bA;
+    const double bytes_Q = dE * dN * bA;
+    const double bytes_K = (dD * dHkv) * dN * bA;
+    const double bytes_V = (dD * dHkv) * dN * bA;
+
+    const double bytes_total =
+        (bytes_wq + bytes_wk + bytes_wv + bytes_wo) +
+        (bytes_X + bytes_Q + bytes_K + bytes_V);
 
     ProjCost pc{};
     pc.flops = flops_total;
@@ -188,13 +208,14 @@ static inline ProjCost estimate_proj_cost_layer(
     return pc;
 }
 
-// 3) FFN per-layer
+// 3) FFN per-layer → Group2에 합산
 struct FFNCost {
     double flops;
     double bytes;
 };
 
-static inline FFNCost estimate_ffn_cost_layer(
+// tllm_profiler 의 FFN 경량 모델과 동일 개념
+static inline FFNCost estimate_ffn_closed_form(
     int E, int F, int N,
     ggml_type wtype, ggml_type act_type
 ) {
@@ -203,15 +224,20 @@ static inline FFNCost estimate_ffn_cost_layer(
     const double dN = (double) N;
 
     // FLOPs (한 레이어 기준)
+    // up    : 2 * F * N * E
+    // gate  : 2 * F * N * E
+    // silu  : 4 * F * N
+    // fused : 1 * F * N
+    // down  : 2 * E * N * F
     const double fl_up    = 2.0 * dF * dN * dE;
     const double fl_gate  = 2.0 * dF * dN * dE;
-    const double fl_silu  = 4.0 * dF * dN;      // activation
-    const double fl_fused = 1.0 * dF * dN;      // elementwise
+    const double fl_silu  = 4.0 * dF * dN;
+    const double fl_fused = 1.0 * dF * dN;
     const double fl_down  = 2.0 * dE * dN * dF;
 
     const double flops_total = fl_up + fl_gate + fl_silu + fl_fused + fl_down;
 
-    // Bytes (러프)
+    // Bytes
     const int bW = bpp_ggml_type(wtype);
     const int bA = bpp_ggml_type(act_type);
 
@@ -225,14 +251,18 @@ static inline FFNCost estimate_ffn_cost_layer(
     const double bytes_fused = dF * dN * bA;
     const double bytes_out   = dE * dN * bA;
 
-    const double bytes_total = (bytes_w_up + bytes_w_gate + bytes_w_down) +
+    const double bytes_total =
+        (bytes_w_up + bytes_w_gate + bytes_w_down) +
         (bytes_X + bytes_up + bytes_gate + bytes_fused + bytes_out);
 
-    return { flops_total, bytes_total };
+    FFNCost fc{};
+    fc.flops = flops_total;
+    fc.bytes = bytes_total;
+    return fc;
 }
 
 // 4) LM Head (한 번만, Group3)
-static inline void estimate_lmhead_cost(
+static inline void estimate_lmhead_closed_form(
     int E, int V, int N,
     ggml_type wtype, ggml_type act_type,
     double & flops_out,
@@ -242,7 +272,9 @@ static inline void estimate_lmhead_cost(
     const double dV = (double) V;
     const double dN = (double) N;
 
-    const double fl = 2.0 * dE * dV * dN;  // [V,E] * [E,N]
+    // FLOPs: [V,E] * [E,N]
+    const double fl = 2.0 * dE * dV * dN;
+
     const int bW = bpp_ggml_type(wtype);
     const int bA = bpp_ggml_type(act_type);
 
@@ -258,7 +290,7 @@ static inline void estimate_lmhead_cost(
 // 메인 분석 함수
 // ──────────────────────────────────────────────
 void ggml_analyze_arithmetic_intensity(
-    const ggml_cgraph * graph,   // 지금은 안 씀
+    const ggml_cgraph * graph,
     const llama_ubatch & ubatch,
     const llama_model  & model) {
 
@@ -311,15 +343,15 @@ void ggml_analyze_arithmetic_intensity(
     double total_flops = 0.0;
     double total_bytes = 0.0;
 
+    // ──────────────────────────────────────────────
     // 1) Attention core (KQVONLY = QK^T + AV) → Group1
-    AttnCoreCost att_core = estimate_attention_core_layer(
+    // ──────────────────────────────────────────────
+    AttnCoreCost att_core = estimate_kqvonly_closed_form(
         n_embd,
         n_head,
         n_head_kv,
         n_tokens,
-        n_ctx,
-        GGML_TYPE_F32,   // activations
-        GGML_TYPE_F16    // KV cache
+        n_ctx
     );
 
     GroupAgg * g_att = find_group_agg(GGML_DVFS_GRP_ATT_CORE);
@@ -335,8 +367,10 @@ void ggml_analyze_arithmetic_intensity(
         total_bytes += g_att->frame.bytes;
     }
 
+    // ──────────────────────────────────────────────
     // 2) Proj(Q/K/V, Wo) + FFN → Group2
-    ProjCost proj_layer = estimate_proj_cost_layer(
+    // ──────────────────────────────────────────────
+    ProjCost proj_layer = estimate_qkvproj_closed_form(
         n_embd,
         n_head,
         n_head_kv,
@@ -344,7 +378,7 @@ void ggml_analyze_arithmetic_intensity(
         GGML_TYPE_F16   // proj weights
     );
 
-    FFNCost ffn_layer = estimate_ffn_cost_layer(
+    FFNCost ffn_layer = estimate_ffn_closed_form(
         n_embd,
         n_ff,
         n_tokens,
@@ -365,10 +399,12 @@ void ggml_analyze_arithmetic_intensity(
         total_bytes += g_mid->frame.bytes;
     }
 
+    // ──────────────────────────────────────────────
     // 3) LM Head → Group3
+    // ──────────────────────────────────────────────
     double fl_lm    = 0.0;
     double bytes_lm = 0.0;
-    estimate_lmhead_cost(
+    estimate_lmhead_closed_form(
         n_embd,
         n_vocab,
         n_tokens,
@@ -531,5 +567,7 @@ void maybe_probe_ai(
 }
 
 void setup_probe_signal() {
-    std::signal(SIGUSR1, [](int){ probe_requested.store(true); });
+    std::signal(SIGUSR1, [](int){
+        probe_requested.store(true);
+    });
 }
