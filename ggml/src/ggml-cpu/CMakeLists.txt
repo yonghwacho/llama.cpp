@@ -48,6 +48,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        ggml-cpu/selector.cpp
+        ggml-cpu/energy_model_decode_group2.cpp
+        ggml-cpu/energy_model_decode_kqvonly.cpp
+        ggml-cpu/energy_model_decode_lmhead.cpp
+        ggml-cpu/energy_model_prefill_group2.cpp
+        ggml-cpu/energy_model_prefill_kqvonly.cpp
+        ggml-cpu/energy_model_prefill_lmhead.cpp
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)

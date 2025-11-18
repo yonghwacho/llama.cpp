@@ -42,6 +42,20 @@
 #define GGML_DVFS_GRP_LM         2
 #endif
 
+// gid(GGML_DVFS_GRP_*) → perf_group(G_KQV, G_OTHER, G_LMHEAD) 매핑
+static inline perf_group perf_group_from_gid(int gid) {
+    switch (gid) {
+        case GGML_DVFS_GRP_ATT_CORE:
+            return G_KQV;       // Attention core → KQV 그룹
+        case GGML_DVFS_GRP_MID:
+            return G_OTHER;     // Proj + FFN   → OTHER
+        case GGML_DVFS_GRP_LM:
+            return G_LMHEAD;    // LM Head      → LMHEAD
+        default:
+            return G_OTHER;     // fallback
+    }
+}
+
 // ──────────────────────────────────────────────
 // probe 플래그 + API
 // ──────────────────────────────────────────────
@@ -136,9 +150,11 @@ static inline AttnCoreCost estimate_kqvonly_closed_form(
     // Bytes:
     //   - Q activations : [H, D, N]
     //   - K/V KV cache read : (E/H * Hkv) * L (per K,V) * bKV
+    const int bW  = bpp_ggml_type(GGML_TYPE_F16);
     const int bA  = bpp_ggml_type(GGML_TYPE_F32);  // activations
     const int bKV = bpp_ggml_type(GGML_TYPE_F16);  // KV cache
 
+    const double bytes_w_wo   = dE * dE * bW;
     const double bytes_Q = dH * dD * dN * bA;
 
     const double dim_kv       = (dE / dH) * dHkv;  // (E/H) * Hkv
@@ -146,7 +162,7 @@ static inline AttnCoreCost estimate_kqvonly_closed_form(
     const double bytes_read_V = dim_kv * dL * bKV;
 
     // Wo weight는 Group2에서만 카운트 (중복 방지)
-    const double bytes_total = bytes_Q + bytes_read_K + bytes_read_V;
+    const double bytes_total = bytes_Q + bytes_read_K + bytes_read_V + bytes_w_wo;
 
     AttnCoreCost ac{};
     ac.flops = flops_total;
@@ -172,7 +188,9 @@ static inline ProjCost estimate_qkvproj_closed_form(
     const double dD   = dE / dH;      // head_dim
     const double dN   = (double) N;
 
-    // FLOPs
+    // -------------------------
+    // FLOPs  (원래 GROUP2와 동일)
+    // -------------------------
     //   Q : 2 * E * E * N
     //   K : 2 * E * (D * Hkv) * N
     //   V : 2 * E * (D * Hkv) * N
@@ -184,60 +202,76 @@ static inline ProjCost estimate_qkvproj_closed_form(
 
     const double flops_total = fl_q + fl_k + fl_v + fl_wo;
 
-    // Bytes (Weights + Activations, tllm_profiler GROUP2와 구조 맞춤)
+    // -------------------------
+    // Bytes (Wq/Wk/Wv/Wo + X/Q/K/V/Y/out)
+    //   - QKV 블록:
+    //       weights: Wq, Wk, Wv
+    //       acts   : X + Q + K + V
+    //   - out proj 블록:
+    //       weights: Wo
+    //       acts   : Y(in) + out
+    // -------------------------
     const int bW = bpp_ggml_type(wtype);
-    const int bA = bpp_ggml_type(GGML_TYPE_F32);
+    const int bA = bpp_ggml_type(GGML_TYPE_F32); // act_ty 대신 F32 고정 근사
 
-    const double bytes_wq = dE * dE         * bW;
-    const double bytes_wk = dE * (dD*dHkv)  * bW;
-    const double bytes_wv = dE * (dD*dHkv)  * bW;
-    const double bytes_wo = dE * dE         * bW;
+    // weights (INCLUDE_WEIGHT_BYTES = true 가정)
+    const double bytes_wq = dE * dE         * bW;            // Wq
+    const double bytes_wk = dE * (dD*dHkv)  * bW;            // Wk
+    const double bytes_wv = dE * (dD*dHkv)  * bW;            // Wv
+    const double bytes_wo = dE * dE         * bW;            // Wo
 
-    const double bytes_X = dE * dN * bA;
-    const double bytes_Q = dE * dN * bA;
-    const double bytes_K = (dD * dHkv) * dN * bA;
-    const double bytes_V = (dD * dHkv) * dN * bA;
+    // activations
+    // QKV 블록: X + Q + K + V
+    const double bytes_X   = dE * dN * bA;                   // X
+    const double bytes_Q   = dE * dN * bA;                   // Q  (dH*dD = dE)
+    const double bytes_K   = (dD * dHkv) * dN * bA;          // K
+    const double bytes_V   = (dD * dHkv) * dN * bA;          // V
+
+    // out proj 블록: Y(in) + out
+    const double bytes_Y   = dE * dN * bA;                   // Y (input to Wo)
+    const double bytes_out = dE * dN * bA;                   // out (output of Wo)
 
     const double bytes_total =
         (bytes_wq + bytes_wk + bytes_wv + bytes_wo) +
-        (bytes_X + bytes_Q + bytes_K + bytes_V);
+        (bytes_X + bytes_Q + bytes_K + bytes_V + bytes_Y + bytes_out);
 
     ProjCost pc{};
     pc.flops = flops_total;
     pc.bytes = bytes_total;
     return pc;
 }
-
 // 3) FFN per-layer → Group2에 합산
 struct FFNCost {
     double flops;
     double bytes;
 };
 
-// tllm_profiler 의 FFN 경량 모델과 동일 개념
+// 원래 tllm_profiler 의 FFN cost (estimate_ffn_cost_closed_form_runtime)와 동일한 식
 static inline FFNCost estimate_ffn_closed_form(
-    int E, int F, int N,
-    ggml_type wtype, ggml_type act_type
+    int E,              // n_embd
+    int F,              // n_ff (expand size)
+    int N,              // n_tokens
+    ggml_type wtype,    // weight dtype (e.g. GGML_TYPE_Q8_0)
+    ggml_type act_type  // activation dtype (e.g. GGML_TYPE_F32)
 ) {
+    if (E <= 0 || F <= 0 || N <= 0) {
+        return { 0.0, 0.0 };
+    }
+
     const double dE = (double) E;
     const double dF = (double) F;
     const double dN = (double) N;
 
-    // FLOPs (한 레이어 기준)
-    // up    : 2 * F * N * E
-    // gate  : 2 * F * N * E
-    // silu  : 4 * F * N
-    // fused : 1 * F * N
-    // down  : 2 * E * N * F
-    const double fl_up    = 2.0 * dF * dN * dE;
-    const double fl_gate  = 2.0 * dF * dN * dE;
-    const double fl_silu  = 4.0 * dF * dN;
-    const double fl_fused = 1.0 * dF * dN;
-    const double fl_down  = 2.0 * dE * dN * dF;
+    // FLOPs (행렬곱은 2*M*N*K 규약, SiLU/elemwise는 근사)
+    const double fl_up     = 2.0 * dF * dN * dE;  // w_up[E,F]   * X[E,N]   -> [F,N]
+    const double fl_gate   = 2.0 * dF * dN * dE;  // w_gate[E,F] * X[E,N]   -> [F,N]
+    const double fl_silu   = 4.0 * dF * dN;       // 근사 (원하면 0으로 둬도 무방)
+    const double fl_fused  = 1.0 * dF * dN;       // elementwise mul
+    const double fl_down   = 2.0 * dE * dN * dF;  // w_down[F,E] * fused[F,N] -> [E,N]
 
     const double flops_total = fl_up + fl_gate + fl_silu + fl_fused + fl_down;
 
-    // Bytes
+    // Bytes (최소 근사: 각 텐서를 1-pass로 다룬다고 가정)
     const int bW = bpp_ggml_type(wtype);
     const int bA = bpp_ggml_type(act_type);
 
@@ -245,11 +279,11 @@ static inline FFNCost estimate_ffn_closed_form(
     const double bytes_w_gate = dE * dF * bW;
     const double bytes_w_down = dF * dE * bW;
 
-    const double bytes_X     = dE * dN * bA;
-    const double bytes_up    = dF * dN * bA;
-    const double bytes_gate  = dF * dN * bA;
-    const double bytes_fused = dF * dN * bA;
-    const double bytes_out   = dE * dN * bA;
+    const double bytes_X      = dE * dN * bA;   // read
+    const double bytes_up     = dF * dN * bA;   // matmul output
+    const double bytes_gate   = dF * dN * bA;   // matmul output
+    const double bytes_fused  = dF * dN * bA;   // mul output
+    const double bytes_out    = dE * dN * bA;   // final write
 
     const double bytes_total =
         (bytes_w_up + bytes_w_gate + bytes_w_down) +
@@ -257,7 +291,9 @@ static inline FFNCost estimate_ffn_closed_form(
 
     FFNCost fc{};
     fc.flops = flops_total;
+    printf("FFN_flops %6f", flops_total);
     fc.bytes = bytes_total;
+    printf("FFN_bytes %6f", bytes_total);
     return fc;
 }
 
@@ -293,6 +329,7 @@ void ggml_analyze_arithmetic_intensity(
     const ggml_cgraph * graph,
     const llama_ubatch & ubatch,
     const llama_model  & model) {
+    init_energy_model();
 
     GGML_UNUSED(graph); // 안 쓰는 파라미터 워닝 제거
 
@@ -358,8 +395,8 @@ void ggml_analyze_arithmetic_intensity(
     if (g_att) {
         g_att->active        = true;
         g_att->frame.group   = G_KQV;  // PerfFrame용 논리 그룹
-        g_att->frame.flops   = att_core.flops * n_layer;
-        g_att->frame.bytes   = att_core.bytes * n_layer;
+        g_att->frame.flops   = att_core.flops;
+        g_att->frame.bytes   = att_core.bytes;
         g_att->frame.ai      = g_att->frame.bytes > 0.0
                                  ? g_att->frame.flops / g_att->frame.bytes
                                  : 0.0;
@@ -382,7 +419,7 @@ void ggml_analyze_arithmetic_intensity(
         n_embd,
         n_ff,
         n_tokens,
-        GGML_TYPE_Q8_0,  // FFN weights
+        GGML_TYPE_F16,  // FFN weights
         GGML_TYPE_F32    // activations
     );
 
@@ -390,8 +427,8 @@ void ggml_analyze_arithmetic_intensity(
     if (g_mid) {
         g_mid->active        = true;
         g_mid->frame.group   = G_OTHER;  // Proj + FFN
-        g_mid->frame.flops   = (proj_layer.flops + ffn_layer.flops) * n_layer;
-        g_mid->frame.bytes   = (proj_layer.bytes + ffn_layer.bytes) * n_layer;
+        g_mid->frame.flops   = (proj_layer.flops + ffn_layer.flops);
+        g_mid->frame.bytes   = (proj_layer.bytes + ffn_layer.bytes);
         g_mid->frame.ai      = g_mid->frame.bytes > 0.0
                                  ? g_mid->frame.flops / g_mid->frame.bytes
                                  : 0.0;
@@ -408,7 +445,7 @@ void ggml_analyze_arithmetic_intensity(
         n_embd,
         n_vocab,
         n_tokens,
-        GGML_TYPE_Q8_0,   // lm_head weight
+        GGML_TYPE_F16,   // lm_head weight
         GGML_TYPE_F32,    // activations
         fl_lm,
         bytes_lm
@@ -521,12 +558,14 @@ void ggml_analyze_arithmetic_intensity(
     }
 
     // ──────────────────────────────────────────────
-    // MCKP 결과 → 그룹별 freq 적용
+    // MCKP 결과 → stage × perf_group 계획으로 저장
+    //   runtime에서는 ggml_dvfs_begin_stage() + ggml_dvfs_apply_if_needed()
+    //   가 이 계획을 보고 sysfs를 실제로 건드림
     // ──────────────────────────────────────────────
     for (size_t gi = 0; gi < groups_c.size(); ++gi) {
         int idx = res.selected_index_per_group
-                  ? res.selected_index_per_group[gi]
-                  : 0;
+                ? res.selected_index_per_group[gi]
+                : 0;
         if (idx < 0 || (size_t) idx >= groups_c[gi].n_choices) {
             idx = 0;
         }
@@ -537,12 +576,16 @@ void ggml_analyze_arithmetic_intensity(
         int mem_khz = ch.m;
         int gid     = gid_list[gi];
 
-        ggml_dvfs_set    (gid, cpu_khz);
-        ggml_memfreq_set (gid, mem_khz);
-        ggml_dvfs_apply_if_needed(gid);
+        // gid(GGML_DVFS_GRP_*) → perf_group(G_KQV / G_OTHER / G_LMHEAD)
+        perf_group pg = perf_group_from_gid(gid);
 
-        printf("[mckp dvfs] gid=%d  cpu=%d kHz  mem=%d kHz  (lat=%.3f ms, E=%.3f J)\n",
-               gid, cpu_khz, mem_khz, ch.latency, ch.energy);
+        // 🔥 여기서 "이번 ubatch의 stage"에 대한 그룹 DVFS plan을 설정
+        ggml_dvfs_set_group_plan(stage, pg, cpu_khz, mem_khz);
+
+        printf("[mckp dvfs] stage=%s gid=%d (perf_group=%d)  cpu=%d kHz  mem=%d kHz"
+            "  (lat=%.3f ms, E=%.3f J)\n",
+            stage == ST_PREFILL ? "PREFILL" : "DECODE",
+            gid, (int)pg, cpu_khz, mem_khz, ch.latency, ch.energy);
     }
 
     free_dpresult_c(&res);
@@ -560,9 +603,6 @@ void maybe_probe_ai(
     const llama_ubatch & ubatch,
     const llama_model  & model
 ) {
-    if (!probe_requested.exchange(false)) {
-        return;
-    }
     ggml_analyze_arithmetic_intensity(graph, ubatch, model);
 }
 

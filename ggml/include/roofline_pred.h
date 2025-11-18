@@ -3,58 +3,83 @@
 #include <cmath>
 #include <algorithm>
 
-// prefill / decode GFLOPS log–log 모델 계수
-//   log(GFLOPS_g) = logk1[g]
-//                 + alpha_core[g] * log(core_khz)
-//                 + beta_mem[g]  * log(mem_khz)
-//                 + gamma_ai[g]  * log(ai)
-extern double g_logk1_prefill      [PERF_G_COUNT];
-extern double g_alpha_core_prefill [PERF_G_COUNT];
-extern double g_beta_mem_prefill   [PERF_G_COUNT];
-extern double g_gamma_ai_prefill   [PERF_G_COUNT];
+// -------------------------------------------------------------
+// Model2 기반 Roofline GFLOPS 모델
+//   α(AI) = alpha0 * exp(-lam_a * AI)
+//   β(AI) = beta0  * (1 + lam_b * AI)
+//   GFLOPS = k * core^α(AI) * mem^β(AI) * AI^γ
+//
+//   latency[s] = flops / (GFLOPS * 1e9)
+//   latency[ms] = latency[s] * 1e3
+// -------------------------------------------------------------
 
-extern double g_logk1_decode       [PERF_G_COUNT];
-extern double g_alpha_core_decode  [PERF_G_COUNT];
-extern double g_beta_mem_decode    [PERF_G_COUNT];
-extern double g_gamma_ai_decode    [PERF_G_COUNT];
+struct RooflineParams {
+    double k;       // scale
+    double alpha0;  // α0
+    double lam_a;   // λ_a
+    double beta0;   // β0
+    double lam_b;   // λ_b
+    double gamma;   // γ (AI exponent)
+};
 
+// (stage, group) 별 파라미터
+//   - prefill: g_roof_prefill[g]
+//   - decode : g_roof_decode[g]
+// 를 selector 쪽 .cpp에서 채워넣으면 됨.
+extern RooflineParams g_roof_prefill[PERF_G_COUNT];
+extern RooflineParams g_roof_decode [PERF_G_COUNT];
+
+// -------------------------------------------------------------
 // PerfFrame + (cpu,mem) → latency [ms]
+//   * f.ai     : arithmetic intensity
+//   * f.flops  : 연산량 (FLOP)
+//   * f.stage  : ST_PREFILL / ST_DECODE
+//   * f.group  : perf_group (G_KQV, G_OTHER, G_LMHEAD, ...)
+// -------------------------------------------------------------
 inline double predict_latency_ms(
     const PerfFrame & f,
-    int cpu_khz,
-    int mem_khz
+    int               cpu_khz,
+    int               mem_khz
 ) {
     const int gi = static_cast<int>(f.group);
 
     const double core = static_cast<double>(cpu_khz);
     const double mem  = static_cast<double>(mem_khz);
-    const double ai   = std::max(f.ai, 1e-9);
-    const double eps  = 1e-9;
 
-    const double log_core = std::log(core + eps);
-    const double log_mem  = std::log(mem  + eps);
-    const double log_ai   = std::log(ai   + eps);
+    const double eps  = 1e-9;
+    const double ai   = std::max(f.ai, eps);
+
+    if (core <= 0.0 || mem <= 0.0) {
+        return 1e9;
+    }
 
     const bool is_prefill = (f.stage == ST_PREFILL);
 
-    const double *logk1   = is_prefill ? g_logk1_prefill      : g_logk1_decode;
-    const double *a_core  = is_prefill ? g_alpha_core_prefill : g_alpha_core_decode;
-    const double *b_mem   = is_prefill ? g_beta_mem_prefill   : g_beta_mem_decode;
-    const double *g_ai    = is_prefill ? g_gamma_ai_prefill   : g_gamma_ai_decode;
+    const RooflineParams &p =
+        is_prefill ? g_roof_prefill[gi] : g_roof_decode[gi];
 
-    const double log_gflops =
-        logk1[gi]
-      + a_core[gi] * log_core
-      + b_mem[gi]  * log_mem
-      + g_ai[gi]   * log_ai;
+    // α(AI), β(AI)
+    const double alpha = p.alpha0 * std::exp(-p.lam_a * ai);
+    const double beta  = p.beta0  * (1.0 + p.lam_b * ai);
 
-    const double gflops = std::exp(log_gflops);
-    if (gflops <= 0.0) {
+    // GFLOPS = k * core^α * mem^β * AI^γ
+    //  - core, mem 단위: kHz (Python에서도 같은 단위로 fit했다고 가정)
+    double gflops = p.k
+                  * std::pow(core, alpha)
+                  * std::pow(mem,  beta )
+                  * std::pow(ai,   p.gamma);
+
+    if (!(gflops > 0.0) || !std::isfinite(gflops)) {
         // 말도 안 되는 값이면 그냥 엄청 큰 latency로 처리
         return 1e9;
     }
 
-    const double flops = f.flops;          // [FLOP]
-    const double t_s   = flops / (gflops * 1e9); // s
-    return t_s * 1e3;                      // ms
+    const double flops = f.flops;  // [FLOP], training 때 사용한 동일 값
+    const double t_s   = flops / (gflops * 1e9); // [s]
+    const double t_ms  = t_s * 1e3;              // [ms]
+
+    if (!std::isfinite(t_ms) || t_ms <= 0.0) {
+        return 1e9;
+    }
+    return t_ms;
 }
