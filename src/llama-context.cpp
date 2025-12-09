@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include "arithmetic_intensity.h"
+#include "ggml-dvfs.h"
 //
 // llama_context
 //
@@ -703,6 +704,7 @@ bool llama_context::apply_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const auto t0_us = ggml_time_us();
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -743,10 +745,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    /* --------------------------
+       (1) Stage 판단 후 DVFS 세팅
+       -------------------------- */
+    ggml_stage stage_now;
+
+    // prefill: ubatch.n_tokens > 1 AND n_past == 0
+    if (ubatch.n_tokens > 1) {
+        stage_now = ST_PREFILL;
+    } else {
+        stage_now = ST_DECODE;
+    }
+
+    // DVFS layer에 stage 변경 알림 (prefill / decode)
+    ggml_dvfs_begin_stage(stage_now);
 
         /*arithmetic intensity compute*/
-        maybe_probe_ai(res->get_gf(), ubatch, model);
-    }
+    maybe_probe_ai(res->get_gf(), ubatch, model);
 
     // set the input data for the input tensors
     {
@@ -763,6 +780,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+    const auto t1_us = ggml_time_us();
+    const double dt_ms = (t1_us - t0_us) / 1000.0;
+
+    // stage / tokens 정보는 ubatch나 ctx에서 가져와서 찍기
+    const char * stage_str = (ubatch.n_tokens > 1)
+                           ? "PREFILL" : "DECODE";
+
+    fprintf(stderr,
+        "[tok-lat] stage=%s, n_tokens=%d, dt=%.3f ms\n",
+        stage_str, ubatch.n_tokens, dt_ms);
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2837,10 +2865,21 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
+
+    const int64_t t0_us = ggml_time_us();
+
     const int ret = ctx->encode(batch);
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
+
+    const int64_t t1_us = ggml_time_us();
+    const double  dt_ms = (t1_us - t0_us) / 1000.0;
+
+    LLAMA_LOG_INFO("TLLM_LATENCY_ENCODE_US=%lld  ms=%.3f  n_tokens=%d\n",
+                (long long)(t1_us - t0_us),
+                dt_ms,
+                batch.n_tokens);
 
     return ret;
 }
@@ -2848,10 +2887,22 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+
+    const int64_t t0_us = ggml_time_us();
+
     const int ret = ctx->decode(batch);
+
+    const int64_t t1_us = ggml_time_us();
+    const double  dt_ms = (t1_us - t0_us) / 1000.0;
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
+
+        // 여기서 디코드 latency 로그
+    LLAMA_LOG_INFO("TLLM_LATENCY_DECODE_US=%lld  ms=%.3f  n_tokens=%d\n",
+                   (long long)(t1_us - t0_us),
+                   dt_ms,
+                   batch.n_tokens);
 
     return ret;
 }

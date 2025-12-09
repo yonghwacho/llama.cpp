@@ -25,6 +25,7 @@ struct Choice {
     int c = -1; // core freq
     int m = -1; // memory freq
     string tag;
+    int original_idx = -1;
 };
 
 struct Group {
@@ -52,6 +53,13 @@ static inline bool dominated(const Choice& a, const Choice& b) {
 void pareto_prune(Group& g) {
     auto &v = g.choices;
     if (v.empty()) return;
+
+    printf("[DEBUG pareto] BEFORE: size=%zu\n", v.size());
+    for (size_t i = 0; i < std::min(v.size(), (size_t)5); ++i) {
+        printf("  [%zu] orig=%d, c=%d, m=%d, lat=%.3f\n",
+               i, v[i].original_idx, v[i].c, v[i].m, v[i].latency);
+    }
+
     sort(v.begin(), v.end(), [](const Choice& A, const Choice& B){
         if (A.latency != B.latency) return A.latency < B.latency;
         return A.energy < B.energy;
@@ -71,10 +79,17 @@ void pareto_prune(Group& g) {
         // Otherwise v[i] is dominated: it has higher latency and equal/higher energy
     }
     v.swap(keep);
+
+    // 🔍 After pruning
+    // printf("[DEBUG pareto] AFTER: size=%zu\n", v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        // printf("  [%zu] orig=%d, c=%d, m=%d, lat=%.3f\n",
+        //        i, v[i].original_idx, v[i].c, v[i].m, v[i].latency);
+    }
 }
 
 /* DP-Based Algorithm Implementation */
-DPResult solve_mckp_dp(vector<Group> groups,
+DPResult solve_mckp_dp(vector<Group>& groups,
                     double T_budget,
                     double time_unit) // E-L measure unit
 {
@@ -82,6 +97,18 @@ DPResult solve_mckp_dp(vector<Group> groups,
 
     int G = (int)groups.size();
     for (auto &g : groups) pareto_prune(g);
+    // ---- DEBUG: after pareto prune ----
+    // printf("==== Pareto prune result ====\n");
+    for (int g = 0; g < (int)groups.size(); ++g) {
+        // printf("[Group %d] name=%s, repeat=%d, choices=%zu\n",
+        //     g, groups[g].name.c_str(), groups[g].repeat, groups[g].choices.size());
+        for (size_t j = 0; j < groups[g].choices.size(); ++j) {
+            const auto &c = groups[g].choices[j];
+            // printf("    idx=%zu  lat=%.3f ms  E=%.6f J  cpu=%d mem=%d\n",
+            //     j, c.latency, c.energy, c.c, c.m);
+        }
+    }
+    // printf("================================\n");
 
     // Build baseline (fastest option per group = smallest latency)
     vector<int> baseIdx(G, -1);
@@ -95,6 +122,18 @@ DPResult solve_mckp_dp(vector<Group> groups,
         T_min += groups[g].repeat * groups[g].choices[0].latency;
         E_min += groups[g].repeat * groups[g].choices[0].energy;
     }
+
+    // ---- DEBUG: baseline check ----
+    printf("==== Baseline summary (fastest choices) ====\n");
+    printf("T_min = %.3f ms, E_min = %.6f J, T_budget = %.3f ms\n",
+        T_min, E_min, T_budget);
+
+    for (int g = 0; g < G; ++g) {
+        const auto &c = groups[g].choices[0];
+        printf("[Group %d baseline] lat=%.3f ms  E=%.6f J  cpu=%d mem=%d (repeat=%d)\n",
+            g, c.latency, c.energy, c.c, c.m, groups[g].repeat);
+    }
+    printf("=============================================\n");
 
     // Terminate if baseline exceeds budget
     if (T_min - 1e-12 > T_budget) {
@@ -173,6 +212,22 @@ DPResult solve_mckp_dp(vector<Group> groups,
     double E_saved = bestVal;
     double E_used = E_min - E_saved;
 
+    // ---- DEBUG: DP result ----
+    printf("==== DP Result ====\n");
+    printf("feasible = %d\n", res.feasible);
+    printf("totalLatency = %.3f ms (budget=%.3f ms)\n", T_used, T_budget);
+    printf("totalEnergy  = %.6f J\n", E_used);
+    printf("energySaved  = %.6f J\n", E_saved);
+    printf("slackUsed    = %.3f ms\n", bestW * time_unit);
+
+    for (int g = 0; g < G; ++g) {
+        int idx = res.pickIndexPerGroup[g];
+        const auto &c = groups[g].choices[idx];
+        printf("[Selected] Group %d -> choice %d : lat=%.3f ms, E=%.6f J, cpu=%d, mem=%d\n",
+            g, idx, c.latency, c.energy, c.c, c.m);
+    }
+    printf("====================\n");
+
     res.feasible = true;
     res.totalLatency = T_used;
     res.totalEnergy = E_used;
@@ -182,7 +237,7 @@ DPResult solve_mckp_dp(vector<Group> groups,
 }
 
 /* Greedy-Based Algorithm Implementation, NeuroBalancer style */
-DPResult solve_mckp_greedy(vector<Group> groups, double T_budget) {
+DPResult solve_mckp_greedy(vector<Group>& groups, double T_budget) {
     int G = (int)groups.size();
     for (auto &g : groups) pareto_prune(g);
 
@@ -272,6 +327,7 @@ DPResultC freq_table_mckp_solver_c(const GroupC* groups,
             cxx.c = cc.c;
             cxx.m = cc.m;
             cxx.tag = cc.tag ? std::string(cc.tag) : std::string();
+            cxx.original_idx = (int)j;  // 추가: 원본 인덱스 저장
             g.choices.push_back(std::move(cxx));
         }
         gin.push_back(std::move(g));
@@ -291,7 +347,23 @@ DPResultC freq_table_mckp_solver_c(const GroupC* groups,
     if (out.n_groups > 0) {
         out.selected_index_per_group = static_cast<int*>(std::malloc(sizeof(int) * out.n_groups));
         if (out.selected_index_per_group) {
-            for (size_t k = 0; k < out.n_groups; ++k) out.selected_index_per_group[k] = core.pickIndexPerGroup[k];
+            for (size_t k = 0; k < out.n_groups; ++k) {
+                int pruned_idx = core.pickIndexPerGroup[k];
+
+                // printf("[DEBUG convert] Group %zu: pruned_idx=%d\n", k, pruned_idx);
+                // printf("[DEBUG convert] gin[%zu].choices[%d]: c=%d, m=%d\n", k, pruned_idx, gin[k].choices[pruned_idx].c, gin[k].choices[pruned_idx].m);
+                
+                // 🔥 추가: Pruned index → Original index 변환
+                int original_idx = gin[k].choices[pruned_idx].original_idx;
+
+                // printf("[DEBUG convert] gin[%zu].choices[%d].original_idx = %d\n", k, pruned_idx, original_idx);
+                if (original_idx < 0) {
+                    original_idx = pruned_idx;  // fallback (혹시 모를 경우)
+                }
+                
+                out.selected_index_per_group[k] = original_idx;
+                // printf("[DEBUG convert] >>> Returning original_idx=%d to caller <<<\n", original_idx);
+            }
         }
     }
     out.totalLatency = core.totalLatency;

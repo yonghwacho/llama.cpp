@@ -2844,7 +2844,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (state->ith == 0) {
-            ggml_dvfs_apply_if_needed(node->op);   // sysfs write 1 회 or no‑op
+            ggml_dvfs_apply_if_needed(node->op,
+                          node->name[0] ? node->name : NULL);
         }
         //printf("[debug] node %4d: name=\"%s\", op=%d\n", node_n, node->name ? node->name : "(null)", node->op);
         
