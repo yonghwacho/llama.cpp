@@ -21,7 +21,7 @@ int main() {
     // sysfs에 실제로 적용
     for (int i = 0; i < num_ops; ++i) {
         int op = ops[i];
-        ggml_dvfs_apply_if_needed(op);
+        ggml_dvfs_apply_if_needed(op, NULL);
         sleep(1);
     }
 

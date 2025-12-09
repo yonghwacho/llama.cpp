@@ -291,9 +291,9 @@ static inline FFNCost estimate_ffn_closed_form(
 
     FFNCost fc{};
     fc.flops = flops_total;
-    printf("FFN_flops %6f", flops_total);
+    //printf("FFN_flops %6f", flops_total);
     fc.bytes = bytes_total;
-    printf("FFN_bytes %6f", bytes_total);
+    //printf("FFN_bytes %6f", bytes_total);
     return fc;
 }
 
@@ -354,19 +354,19 @@ void ggml_analyze_arithmetic_intensity(
     }
 
     if (n_tokens <= 0 || n_embd <= 0 || n_layer <= 0) {
-        printf("[AI] invalid hparams: n_tokens=%d, n_embd=%d, n_layer=%d\n",
-               n_tokens, n_embd, n_layer);
+        // printf("[AI] invalid hparams: n_tokens=%d, n_embd=%d, n_layer=%d\n",
+        //        n_tokens, n_embd, n_layer);
         return;
     }
 
     ggml_stage stage = infer_stage_from_ubatch(ubatch);
-    printf("[AI] stage=%s, n_tokens=%d, n_ctx=%d\n",
-           stage == ST_PREFILL ? "PREFILL" : "DECODE",
-           n_tokens, n_ctx);
+    // printf("[AI] stage=%s, n_tokens=%d, n_ctx=%d\n",
+    //        stage == ST_PREFILL ? "PREFILL" : "DECODE",
+    //        n_tokens, n_ctx);
 
-    printf("[AI] params: n_layer=%d, n_embd=%d, n_head=%d, n_head_kv=%d, "
-           "n_ff=%d, n_vocab=%d, n_tokens=%d, n_ctx=%d\n",
-           n_layer, n_embd, n_head, n_head_kv, n_ff, n_vocab, n_tokens, n_ctx);
+    // printf("[AI] params: n_layer=%d, n_embd=%d, n_head=%d, n_head_kv=%d, "
+    //        "n_ff=%d, n_vocab=%d, n_tokens=%d, n_ctx=%d\n",
+    //        n_layer, n_embd, n_head, n_head_kv, n_ff, n_vocab, n_tokens, n_ctx);
 
     // ──────────────────────────────────────────────
     // 그룹 초기화 (+ stage 세팅)
@@ -484,6 +484,10 @@ void ggml_analyze_arithmetic_intensity(
     std::vector<std::vector<ChoiceC>> choices_storage;
     std::vector<int>                  gid_list;
 
+    choices_storage.reserve(10);  // 충분히 큰 값
+    groups_c.reserve(10);
+    gid_list.reserve(10);
+
     for (auto & g : g_groups) {
         if (!g.active || g.frame.bytes <= 0.0) continue;
 
@@ -497,19 +501,39 @@ void ggml_analyze_arithmetic_intensity(
 
         GroupC gc{};
         gc.name      = nullptr;
-        gc.repeat    = 1;                            // 토큰당 1번
+        perf_group pg = perf_group_from_gid(g.gid);
+
+        // 🔥 FIX: repeat 값 설정 (이 부분이 완전히 빠져있었음!)
+        int repeat = 1;
+        if (pg == G_LMHEAD) {
+            repeat = 1;  // LM Head는 1번만
+        } else {
+            repeat = n_layer;  // KQV, OTHER는 레이어 수만큼
+        }
+        gc.repeat = repeat;
+
+        // 🔍 디버깅: 포인터 주소 확인
+        // printf("[DEBUG] gi=%zu, gid=%d, pg=%d, repeat=%d, choices ptr=%p, size=%zu, first c=%d, first m=%d\n",
+        //     groups_c.size(),
+        //     g.gid,
+        //     (int)pg,
+        //     repeat,
+        //     (void*)choices_storage.back().data(),
+        //     choices_storage.back().size(),
+        //     choices_storage.back()[0].c,
+        //     choices_storage.back()[0].m);
+        
         gc.n_choices = choices_storage.back().size();
         gc.choices   = choices_storage.back().data();
 
         groups_c.push_back(gc);
         gid_list.push_back(g.gid);
     }
-
     if (groups_c.empty()) {
-        printf("[mckp] no active group, skip\n");
+        // printf("[mckp] no active group, skip\n");
         double total_ai = total_bytes > 0.0 ? total_flops / total_bytes : 0.0;
-        printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
-               total_flops, total_bytes, total_ai);
+        // printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
+        //        total_flops, total_bytes, total_ai);
         return;
     }
 
@@ -528,7 +552,7 @@ void ggml_analyze_arithmetic_intensity(
         T_min += best * gc.repeat;
     }
 
-    const double slack_ratio      = 0.10;
+    const double slack_ratio      = 0.01;
     const double T_budget_prefill = T_min * (1.0 + slack_ratio);
 
     double T_budget;
@@ -540,6 +564,16 @@ void ggml_analyze_arithmetic_intensity(
 
     const double time_unit = 0.1;   // 0.1ms resolution
 
+    // 🔍 MCKP 호출 직전 검증
+    for (size_t i = 0; i < groups_c.size(); ++i) {
+        // printf("[DEBUG] Before MCKP gi=%zu, ptr=%p, n_choices=%zu, first c=%d, first m=%d\n",
+        //     i,
+        //     (void*)groups_c[i].choices,
+        //     groups_c[i].n_choices,
+        //     groups_c[i].choices[0].c,
+        //     groups_c[i].choices[0].m);
+    }
+
     DPResultC res = freq_table_mckp_solver_c(
         groups_c.data(),
         groups_c.size(),
@@ -548,12 +582,23 @@ void ggml_analyze_arithmetic_intensity(
         /*use_dp=*/true
     );
 
+    // 🔍 MCKP 결과 직후 검증
+    for (size_t gi = 0; gi < groups_c.size(); ++gi) {
+        int idx = res.selected_index_per_group[gi];
+        // // printf("[DEBUG] After MCKP gi=%zu, selected_idx=%d, ptr=%p\n",
+        //     gi, idx, (void*)groups_c[gi].choices);
+        
+        const ChoiceC & ch = groups_c[gi].choices[idx];
+        // printf("[DEBUG] Selected choice: c=%d, m=%d, lat=%.3f, E=%.6f\n",
+        //     ch.c, ch.m, ch.latency, ch.energy);
+    }
+
     if (!res.feasible) {
-        printf("[mckp] infeasible, fallback to baseline\n");
+        //printf("[mckp] infeasible, fallback to baseline\n");
         free_dpresult_c(&res);
         double total_ai = total_bytes > 0.0 ? total_flops / total_bytes : 0.0;
-        printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
-               total_flops, total_bytes, total_ai);
+        // printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
+        //        total_flops, total_bytes, total_ai);
         return;
     }
 
@@ -591,8 +636,8 @@ void ggml_analyze_arithmetic_intensity(
     free_dpresult_c(&res);
 
     double total_ai = total_bytes > 0.0 ? total_flops / total_bytes : 0.0;
-    printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
-           total_flops, total_bytes, total_ai);
+    // printf("=== TOTAL: FLOP=%.0f  Bytes=%.0f  AI=%.6f ===\n",
+    //        total_flops, total_bytes, total_ai);
 }
 
 // ──────────────────────────────────────────────

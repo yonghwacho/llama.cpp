@@ -66,7 +66,7 @@ inline double hybrid_log_residual(
 
     double ratio    = fc_g / fm_g;
     double pow_term = fc_g*fc_g*fc_g + fm_g*fm_g*fm_g;
-    printf("pow_term %.6f \n", pow_term);
+    // printf("pow_term %.6f \n", pow_term);
     // z_raw = [log(fc_g), log(fm_g), log(fc_g/fm_g), log(lat), log(fc_g^3+fm_g^3)]
     double z_raw[HybridFc3Fm3Mlp::IN_DIM];
     z_raw[0] = log(fc_g);
@@ -99,7 +99,7 @@ inline double hybrid_log_residual(
     for (int i = 0; i < HybridFc3Fm3Mlp::H1; ++i) {
         out += m.W2[i][0] * h1[i];
     }
-    printf("mlp_out %6f", out);
+    // printf("mlp_out %6f", out);
 
     return out;  // log-residual
 }
@@ -131,9 +131,9 @@ inline double predict_energy_j(
     const HybridFc3Fm3Mlp & m = em.model[s][g];
 
     const double cpu = static_cast<double>(cpu_khz);
-    printf("cpu_freq %6f", cpu);
+    // printf("cpu_freq %6f", cpu);
     const double mem = static_cast<double>(mem_khz);
-    printf("mem_freq %6f", mem);
+    // printf("mem_freq %6f", mem);
     const double lat = static_cast<double>(latency_scaled);
 
 
@@ -141,9 +141,9 @@ inline double predict_energy_j(
     if (base <= 0.0) base = 1e-12;
 
     double log_base = log(base);
-    printf("temp %.6f \n", base);
+    // printf("temp %.6f \n", base);
     double log_res  = hybrid_log_residual(m, cpu, mem, lat);
-    printf("temp_log_res %.6f \n", log_res);
+    // printf("temp_log_res %.6f \n", log_res);
     double logE     = log_base + log_res;
     double E        = exp(logE);
 
