@@ -1727,7 +1727,7 @@ struct test_case {
             const int bA  = bpp_ggml_type(GGML_TYPE_F32);
             const int bKV = bpp_ggml_type(GGML_TYPE_F16);
 
-            const double bytes_w_wo   = dE * dE * bW;
+            // const double bytes_w_wo   = dE * dE * bW; [yh] 여기서 output projection을 빼야함
             const double bytes_Q      = dH * dD * dN * bA;   // 이미 RoPE된 Q
 
             // (옵션) K/V 스트리밍 read 포함
@@ -1735,7 +1735,7 @@ struct test_case {
             const double bytes_read_K = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
             const double bytes_read_V = INCLUDE_KV_STREAM_READS ? ( (double) ( (E/H) * Hkv ) * dL * bKV ) : 0.0;
 
-            bytes_per_run = bytes_w_wo + bytes_Q + bytes_read_K + bytes_read_V;
+            bytes_per_run = bytes_Q + bytes_read_K + bytes_read_V;
         } else if (current_op_name == "QKVPROJ") {
             // head dim
             const double dE  = (double) E;
@@ -2025,7 +2025,7 @@ struct test_case {
             total_runs++;     
         // Minsung Note: currently runs test case only one time.
         // There is no difference in results for single run and multiple run.
-        } while (total_runs < 1);
+        } while (total_runs < 10000);
 
         // 집계
         const double secs        = total_time_us / 1e6;
@@ -5800,7 +5800,7 @@ struct test_attention : public test_llm {
 
         // 5) 코어 호출 (내부에서 softmax + AV + Wo 까지 수행)
         //    - scale = 1/sqrt(D)
-        ggml_tensor * out = llm_build_kqv_modified(ctx, k_l, v_l, q_cur, kq_mask,
+        ggml_tensor * out = llm_build_kqv_modified_wo_outproj(ctx, k_l, v_l, q_cur, kq_mask,
                                                 1.0f/std::sqrt((float)hp.n_embd_head));
         ggml_set_name(out, "kqv_core_out");
         return out;
