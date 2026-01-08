@@ -2025,7 +2025,7 @@ struct test_case {
             total_runs++;     
         // Minsung Note: currently runs test case only one time.
         // There is no difference in results for single run and multiple run.
-        } while (total_runs < 10000);
+        } while (total_runs < 1);
 
         // 집계
         const double secs        = total_time_us / 1e6;
@@ -5768,7 +5768,7 @@ struct test_attention : public test_llm {
         return out;
     };
 
-    // KQV (with outprojection. see llm_build_kqv_modified() below)
+    // KQV (with out outprojection. see llm_build_kqv_modified_wo_outproj() below)
     auto build_kqv_only = [&](ggml_tensor * ) -> ggml_tensor * {
         std::cout << "build_kqv_only" << "\n";
         // 1) Q_cur  : [D, H, N] (F32)
