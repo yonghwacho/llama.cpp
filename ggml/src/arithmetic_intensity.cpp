@@ -10,6 +10,7 @@
 #include "roofline_pred.h"
 #include "energy_model.h"
 #include "ggml-mckp-freq.h"
+#include "roofline_gflops.h"
 
 // llama 내부 타입 정의
 #include "llama-batch.h"   // struct llama_ubatch
@@ -162,7 +163,7 @@ static inline AttnCoreCost estimate_kqvonly_closed_form(
     const double bytes_read_V = dim_kv * dL * bKV;
 
     // Wo weight는 Group2에서만 카운트 (중복 방지)
-    const double bytes_total = bytes_Q + bytes_read_K + bytes_read_V + bytes_w_wo;
+    const double bytes_total = bytes_Q + bytes_read_K + bytes_read_V;
 
     AttnCoreCost ac{};
     ac.flops = flops_total;
@@ -494,7 +495,12 @@ void ggml_analyze_arithmetic_intensity(
         FreqCandidates cand{};
         build_freq_candidates_for_group(g.gid, cand);
 
-        auto choices = build_choices_for_mckp(g.frame, g_em, cand);
+        auto choices = roofline_build_ridge_choices(
+            g.frame,
+            cand,
+            get_energy_cb(),
+            (void*)&g_em
+        );
         if (choices.empty()) continue;
 
         choices_storage.emplace_back(std::move(choices));

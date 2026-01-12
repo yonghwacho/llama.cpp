@@ -211,6 +211,8 @@ add_library(ggml-base STATIC
             arithmetic_intensity.cpp
             freq_ai_policy.cpp
             roofline_select.cpp
+            roofline_gflops.cpp
+            roofline_params_init.cpp
             ggml-cpu/ggml-mckp-dvfs.cpp
             ggml-cpu/selector.cpp
             )
