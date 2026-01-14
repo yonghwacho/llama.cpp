@@ -8,6 +8,10 @@
 #include "energy_model.h"     // EnergyModel, predict_energy_j()
 #include "roofline_pred.h"    // predict_latency_ms()
 #include "ggml-mckp-freq.h"   // ChoiceC
+#include "roofline_gflops.h"   // energy_predict_cb_t
+
+
+energy_predict_cb_t get_energy_cb();
 
 // 전역 에너지 모델 (정의는 selector.cpp 쪽)
 extern EnergyModel g_em;
