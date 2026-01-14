@@ -565,7 +565,7 @@ void ggml_analyze_arithmetic_intensity(
     if (stage == ST_PREFILL) {
         T_budget = T_budget_prefill;
     } else { // ST_DECODE 등
-        T_budget = 300.0;   // ms
+        T_budget = 200.0;   // ms
     }
 
     const double time_unit = 0.1;   // 0.1ms resolution
