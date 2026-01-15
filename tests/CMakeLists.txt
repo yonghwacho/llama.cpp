@@ -110,6 +110,8 @@ endfunction()
 
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
+llama_build(tllm_profiler.cpp)
+llama_build(tllm_profiler_qwen.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
