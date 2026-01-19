@@ -1,6 +1,10 @@
 // ggml-dvfs.h
 #pragma once
-#include <stdatomic.h>
+#ifdef __cplusplus
+  #include <atomic>
+#else
+  #include <stdatomic.h>
+#endif
 #include "perf_frame.h"
 
 #ifdef __cplusplus
@@ -10,9 +14,13 @@ extern "C" {
 // ---------- (A) per-op DVFS 테이블 ----------
 #define GGML_DVFS_MAX_OP 128
 
+#ifdef __cplusplus
+extern std::atomic<int> g_op_freq_table[GGML_DVFS_MAX_OP];
+extern std::atomic<int> g_op_memfreq_table[GGML_DVFS_MAX_OP];
+#else
 extern _Atomic int g_op_freq_table[GGML_DVFS_MAX_OP];
 extern _Atomic int g_op_memfreq_table[GGML_DVFS_MAX_OP];
-
+#endif
 // op_id별 목표 주파수 설정/조회
 void ggml_dvfs_set(int op_id, int khz);
 int  ggml_dvfs_get(int op_id);
