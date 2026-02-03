@@ -1,7 +1,7 @@
 #if defined(_MSC_VER)
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
-
+#include "tllm_dvfs.h"
 #include "ggml.h"
 #include "gguf.h"
 
@@ -52,6 +52,9 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+// ggml 쪽에 DVFS model pack id를 전달하기 위한 extern
+extern "C" void ggml_dvfs_set_model_alias(const char * alias);
 
 //
 // CPU utils
@@ -917,6 +920,19 @@ struct common_init_result common_init_from_params(common_params & params) {
         LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
         return iparams;
     }
+
+    // ------------------------------------------------------------
+    // DVFS model pack selection (consume --dvfs-model)
+    // ------------------------------------------------------------
+    if (!params.dvfs_model.empty()) {
+        // "auto" means: pick by model metadata / filename inside your DVFS module
+        // else: treat as explicit model-pack id (e.g., "qwen2.5-1.5b")
+        //
+        // TODO: replace `tllm_dvfs_select_model_pack(...)` with your real entry point.
+        tllm_dvfs_select_model_pack(params.dvfs_model.c_str(), model, params.model.path.c_str());
+    }
+    // 선택된 pack id를 ggml 레이어로 주입
+    ggml_dvfs_set_model_alias(tllm_dvfs_get_selected_pack_id());
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 

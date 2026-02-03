@@ -70,6 +70,8 @@ add_library(${TARGET} STATIC
     sampling.h
     speculative.cpp
     speculative.h
+    tllm_dvfs.cpp
+    tllm_dvfs.h
     )
 
 if (BUILD_SHARED_LIBS)

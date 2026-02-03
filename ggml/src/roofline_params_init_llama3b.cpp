@@ -24,7 +24,7 @@ static inline RooflineGflopsParams make_params(
     return p;
 }
 
-void init_roofline_params() {
+void init_llama3b_roofline_params() {
     // ------------------------------------------------------------
     // 예시: 너가 준 profile_summary 한 줄을 ST_PREFILL + G_KQV에 넣는 예
     //
@@ -41,94 +41,94 @@ void init_roofline_params() {
     // python 코드에서 median은:
     // baseline_cpu_ridge = cpu_needed
     // baseline_mif_ridge = mif_needed
-
-    roofline_set_params(
-        ST_PREFILL, G_KQV,
-        RooflineGflopsParams{
-            /*k_c1_over_c2=*/0.00323474289632642983,
-            /*sweep_axis=*/RooflineSweepAxis::MEM_SWEEP,
-            /*max_candidates=*/64,
-
-            // Python ridge-scaling baseline
-            /*baseline_lat_us=*/406207.799999999988,
-            /*baseline_flops=*/8589930000,
-            /*baseline_cpu_ridge=*/2687000,
-            /*baseline_mif_ridge=*/1014000,
-        }
-    );
-
-    roofline_set_params(
-        ST_PREFILL, G_LMHEAD,
-        RooflineGflopsParams{
-            /*k_c1_over_c2=*/0.00626029284449171157,
-            /*sweep_axis=*/RooflineSweepAxis::MEM_SWEEP,
-            /*max_candidates=*/64,
-
-            // Python ridge-scaling baseline
-            /*baseline_lat_us=*/21112125.1999999993,
-            /*baseline_flops=*/537945000000,
-            /*baseline_cpu_ridge=*/2687000,
-            /*baseline_mif_ridge=*/845000,
-        }
-    );
-
-    roofline_set_params(
-        ST_PREFILL, G_OTHER,
-        RooflineGflopsParams{
-            /*k_c1_over_c2=*/0.00706497641525288735,
-            /*sweep_axis=*/RooflineSweepAxis::MEM_SWEEP,
-            /*max_candidates=*/64,
-
-            // Python ridge-scaling baseline
-            /*baseline_lat_us=*/4868697.70000000019,
-            /*baseline_flops=*/124596000000,
-            /*baseline_cpu_ridge=*/2687000,
-            /*baseline_mif_ridge=*/845000,
-        }
-    );
-
     roofline_set_params(
         ST_DECODE, G_KQV,
         RooflineGflopsParams{
-            /*k_c1_over_c2=*/0.66506060199274919,
-            /*sweep_axis=*/RooflineSweepAxis::MEM_SWEEP,
-            /*max_candidates=*/64,
-
-            // Python ridge-scaling baseline
-            /*baseline_lat_us=*/903.355999999999995,
-            /*baseline_flops=*/8396800,
-            /*baseline_cpu_ridge=*/2687000,
-            /*baseline_mif_ridge=*/1014000,
-        }
-    );
-
-    roofline_set_params(
-        ST_DECODE, G_OTHER,
-        RooflineGflopsParams{
-            /*k_c1_over_c2=*/0.613270524850239251,
+            /*k_c1_over_c2=*/0.000204661126952782486,
             /*sweep_axis=*/RooflineSweepAxis::CPU_SWEEP,
             /*max_candidates=*/64,
 
             // Python ridge-scaling baseline
-            /*baseline_lat_us=*/6880.48300000000017,
-            /*baseline_flops=*/121676000,
-            /*baseline_cpu_ridge=*/2294000,
-            /*baseline_mif_ridge=*/3744000,
+            /*baseline_lat_us=*/589.780999999999949,
+            /*baseline_flops=*/12595200,
+            /*baseline_cpu_ridge=*/1958400,
+            /*baseline_mif_ridge=*/3199000000,
         }
     );
 
     roofline_set_params(
         ST_DECODE, G_LMHEAD,
         RooflineGflopsParams{
-            /*k_c1_over_c2=*/1.98939752845365603,
+            /*k_c1_over_c2=*/0.000612599175772006563,
+            /*sweep_axis=*/RooflineSweepAxis::CPU_SWEEP,
+            /*max_candidates=*/64,
+
+            // Python ridge-scaling baseline
+            /*baseline_lat_us=*/25429.497000000003,
+            /*baseline_flops=*/788005000,
+            /*baseline_cpu_ridge=*/1958400,
+            /*baseline_mif_ridge=*/3199000000,
+        }
+    );
+
+    roofline_set_params(
+        ST_DECODE, G_LMHEAD,
+        RooflineGflopsParams{
+            /*k_c1_over_c2=*/0.000612599175772006563,
+            /*sweep_axis=*/RooflineSweepAxis::CPU_SWEEP,
+            /*max_candidates=*/64,
+
+            // Python ridge-scaling baseline
+            /*baseline_lat_us=*/25429.497000000003,
+            /*baseline_flops=*/788005000,
+            /*baseline_cpu_ridge=*/1958400,
+            /*baseline_mif_ridge=*/3199000000,
+        }
+    );
+
+
+    roofline_set_params(
+        ST_PREFILL, G_LMHEAD,
+        RooflineGflopsParams{
+            /*k_c1_over_c2=*/7.9486271643291141e-06,
             /*sweep_axis=*/RooflineSweepAxis::MEM_SWEEP,
             /*max_candidates=*/64,
 
             // Python ridge-scaling baseline
-            /*baseline_lat_us=*/32385.7010000000009,
-            /*baseline_flops=*/525337000,
-            /*baseline_cpu_ridge=*/2687000,
-            /*baseline_mif_ridge=*/1352000,
+            /*baseline_lat_us=*/3019778.89999999991,
+            /*baseline_flops=*/394002000000,
+            /*baseline_cpu_ridge=*/1984000,
+            /*baseline_mif_ridge=*/665600000,
+        }
+    );
+
+    roofline_set_params(
+        ST_PREFILL, G_OTHER,
+        RooflineGflopsParams{
+            /*k_c1_over_c2=*/1.66336339734317193e-06,
+            /*sweep_axis=*/RooflineSweepAxis::CPU_SWEEP,
+            /*max_candidates=*/64,
+
+            // Python ridge-scaling baseline
+            /*baseline_lat_us=*/1199097.30000000005,
+            /*baseline_flops=*/138443000000,
+            /*baseline_cpu_ridge=*/1881600,
+            /*baseline_mif_ridge=*/3199000000,
+        }
+    );
+
+    roofline_set_params(
+        ST_PREFILL, G_KQV,
+        RooflineGflopsParams{
+            /*k_c1_over_c2=*/1.56849015317286657e-06,
+            /*sweep_axis=*/RooflineSweepAxis::CPU_SWEEP,
+            /*max_candidates=*/64,
+
+            // Python ridge-scaling baseline
+            /*baseline_lat_us=*/74431.5,
+            /*baseline_flops=*/3072000000,
+            /*baseline_cpu_ridge=*/1881600,
+            /*baseline_mif_ridge=*/3199000000,
         }
     );
 }

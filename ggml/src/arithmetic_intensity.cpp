@@ -519,15 +519,15 @@ void ggml_analyze_arithmetic_intensity(
         gc.repeat = repeat;
 
         // 🔍 디버깅: 포인터 주소 확인
-        // printf("[DEBUG] gi=%zu, gid=%d, pg=%d, repeat=%d, choices ptr=%p, size=%zu, first c=%d, first m=%d\n",
-        //     groups_c.size(),
-        //     g.gid,
-        //     (int)pg,
-        //     repeat,
-        //     (void*)choices_storage.back().data(),
-        //     choices_storage.back().size(),
-        //     choices_storage.back()[0].c,
-        //     choices_storage.back()[0].m);
+        printf("[DEBUG] gi=%zu, gid=%d, pg=%d, repeat=%d, choices ptr=%p, size=%zu, first c=%d, first m=%d\n",
+            groups_c.size(),
+            g.gid,
+            (int)pg,
+            repeat,
+            (void*)choices_storage.back().data(),
+            choices_storage.back().size(),
+            choices_storage.back()[0].c,
+            choices_storage.back()[0].m);
         
         gc.n_choices = choices_storage.back().size();
         gc.choices   = choices_storage.back().data();
@@ -565,19 +565,19 @@ void ggml_analyze_arithmetic_intensity(
     if (stage == ST_PREFILL) {
         T_budget = T_budget_prefill;
     } else { // ST_DECODE 등
-        T_budget = 200.0;   // ms
+        T_budget = 150.0;   // ms
     }
 
     const double time_unit = 0.1;   // 0.1ms resolution
 
     // 🔍 MCKP 호출 직전 검증
     for (size_t i = 0; i < groups_c.size(); ++i) {
-        // printf("[DEBUG] Before MCKP gi=%zu, ptr=%p, n_choices=%zu, first c=%d, first m=%d\n",
-        //     i,
-        //     (void*)groups_c[i].choices,
-        //     groups_c[i].n_choices,
-        //     groups_c[i].choices[0].c,
-        //     groups_c[i].choices[0].m);
+        printf("[DEBUG] Before MCKP gi=%zu, ptr=%p, n_choices=%zu, first c=%d, first m=%d\n",
+            i,
+            (void*)groups_c[i].choices,
+            groups_c[i].n_choices,
+            groups_c[i].choices[0].c,
+            groups_c[i].choices[0].m);
     }
 
     DPResultC res = freq_table_mckp_solver_c(
@@ -591,12 +591,12 @@ void ggml_analyze_arithmetic_intensity(
     // 🔍 MCKP 결과 직후 검증
     for (size_t gi = 0; gi < groups_c.size(); ++gi) {
         int idx = res.selected_index_per_group[gi];
-        // // printf("[DEBUG] After MCKP gi=%zu, selected_idx=%d, ptr=%p\n",
-        //     gi, idx, (void*)groups_c[gi].choices);
+        printf("[DEBUG] After MCKP gi=%zu, selected_idx=%d, ptr=%p\n",
+            gi, idx, (void*)groups_c[gi].choices);
         
         const ChoiceC & ch = groups_c[gi].choices[idx];
-        // printf("[DEBUG] Selected choice: c=%d, m=%d, lat=%.3f, E=%.6f\n",
-        //     ch.c, ch.m, ch.latency, ch.energy);
+        printf("[DEBUG] Selected choice: c=%d, m=%d, lat=%.3f, E=%.6f\n",
+            ch.c, ch.m, ch.latency, ch.energy);
     }
 
     if (!res.feasible) {

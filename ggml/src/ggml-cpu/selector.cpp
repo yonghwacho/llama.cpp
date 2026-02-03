@@ -5,6 +5,14 @@
 #include <iostream>
 #include "roofline_params_init.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+const char * ggml_dvfs_get_model_alias(void);
+#ifdef __cplusplus
+}
+#endif
+
 //    HybridFc3Fm3Mlp 기반 EnergyModel을 사용.
 // energy_model.h 에서 선언된 전역
 EnergyModel g_em{};
@@ -15,9 +23,24 @@ EnergyModel g_em{};
 extern void init_energy_model_decode_lmhead();
 extern void init_energy_model_decode_KQVONLY();
 extern void init_energy_model_decode_group2();
-extern void init_energy_model_prefill_KQVONLY();
-extern void init_energy_model_prefill_group2();
+extern void init_energy_model_prefill_KQVONLY(); 
+extern void init_energy_model_prefill_group2(); 
 extern void init_energy_model_prefill_lmhead();
+
+extern void init_qwen_energy_model_decode_KQVONLY();
+extern void init_qwen_energy_model_decode_group2();
+extern void init_qwen_energy_model_decode_lmhead();
+extern void init_qwen_energy_model_prefill_KQVONLY();
+extern void init_qwen_energy_model_prefill_group2();
+extern void init_qwen_energy_model_prefill_lmhead();
+
+extern void init_llama3b_energy_model_decode_KQVONLY();
+extern void init_llama3b_energy_model_decode_group2();
+extern void init_llama3b_energy_model_decode_lmhead();
+extern void init_llama3b_energy_model_prefill_KQVONLY();
+extern void init_llama3b_energy_model_prefill_group2();
+extern void init_llama3b_energy_model_prefill_lmhead();
+
 
 void init_energy_model() {
     // std::cout << "init_energy_model" << "\n";
@@ -26,14 +49,38 @@ void init_energy_model() {
     //    (hybrid_decode_lmhead_init.cpp 안에서
     //     g_em.model[ST_DECODE][G_LMHEAD] 을 채우고
     //     g_em.enabled[ST_DECODE][G_LMHEAD] = true 로 설정.)
-    init_energy_model_decode_KQVONLY();
-    init_energy_model_decode_group2();
-    init_energy_model_decode_lmhead();
-    init_energy_model_prefill_KQVONLY();
-    init_energy_model_prefill_group2();
-    init_energy_model_prefill_lmhead();
+    const char * pack = ggml_dvfs_get_model_alias();
 
+    if (strcmp(pack, "llama3.2-1b") == 0) {
+        init_energy_model_decode_KQVONLY();
+        init_energy_model_decode_group2();
+        init_energy_model_decode_lmhead();
+        init_energy_model_prefill_KQVONLY();
+        init_energy_model_prefill_group2();
+        init_energy_model_prefill_lmhead();
+    } else if (strcmp(pack, "qwen2.5-1.5b") == 0) {
+        init_qwen_energy_model_decode_KQVONLY();
+        init_qwen_energy_model_decode_group2();
+        init_qwen_energy_model_decode_lmhead();
+        init_qwen_energy_model_prefill_KQVONLY();
+        init_qwen_energy_model_prefill_group2();
+        init_qwen_energy_model_prefill_lmhead();
+    } else {
+        init_llama3b_energy_model_decode_KQVONLY();
+        init_llama3b_energy_model_decode_group2();
+        init_llama3b_energy_model_decode_lmhead();
+        init_llama3b_energy_model_prefill_KQVONLY();
+        init_llama3b_energy_model_prefill_group2();
+        init_llama3b_energy_model_prefill_lmhead();
+    }
+
+    if (strcmp(pack, "llama3.2-1b") == 0) {
     init_roofline_params();
+    } else if (strcmp(pack, "qwen2.5-1.5b") == 0) {
+    init_qwen_roofline_params();
+    } else {
+    init_llama3b_roofline_params();
+    }
 }
 
 // 콜백: roofline_gflops.cpp가 얘를 호출해서 energy를 채움

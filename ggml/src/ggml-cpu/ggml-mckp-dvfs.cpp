@@ -212,6 +212,12 @@ DPResult solve_mckp_dp(vector<Group>& groups,
     double E_saved = bestVal;
     double E_used = E_min - E_saved;
 
+    res.feasible = true;
+    res.totalLatency = T_used;
+    res.totalEnergy = E_used;
+    res.energySaved = E_saved;
+    res.slackUsed = bestW * time_unit;
+
     // ---- DEBUG: DP result ----
     printf("==== DP Result ====\n");
     printf("feasible = %d\n", res.feasible);
@@ -228,18 +234,13 @@ DPResult solve_mckp_dp(vector<Group>& groups,
     }
     printf("====================\n");
 
-    res.feasible = true;
-    res.totalLatency = T_used;
-    res.totalEnergy = E_used;
-    res.energySaved = E_saved;
-    res.slackUsed = bestW * time_unit;
     return res;
 }
 
 /* Greedy-Based Algorithm Implementation, NeuroBalancer style */
 DPResult solve_mckp_greedy(vector<Group>& groups, double T_budget) {
     int G = (int)groups.size();
-    for (auto &g : groups) pareto_prune(g);
+    //for (auto &g : groups) pareto_prune(g);
 
     vector<int> cur(G, 0); // current index per group (start at fastest)
     double T = 0.0, E = 0.0;

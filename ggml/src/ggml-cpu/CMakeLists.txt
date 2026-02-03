@@ -55,6 +55,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/energy_model_prefill_group2.cpp
         ggml-cpu/energy_model_prefill_kqvonly.cpp
         ggml-cpu/energy_model_prefill_lmhead.cpp
+        ggml-cpu/energy_model_decode_group2_llama3b.cpp
+        ggml-cpu/energy_model_decode_kqvonly_llama3b.cpp
+        ggml-cpu/energy_model_decode_lmhead_llama3b.cpp
+        ggml-cpu/energy_model_prefill_group2_llama3b.cpp
+        ggml-cpu/energy_model_prefill_kqvonly_llama3b.cpp
+        ggml-cpu/energy_model_prefill_lmhead_llama3b.cpp
+        ggml-cpu/energy_model_decode_group2_qwen.cpp
+        ggml-cpu/energy_model_decode_kqvonly_qwen.cpp
+        ggml-cpu/energy_model_decode_lmhead_qwen.cpp
+        ggml-cpu/energy_model_prefill_group2_qwen.cpp
+        ggml-cpu/energy_model_prefill_kqvonly_qwen.cpp
+        ggml-cpu/energy_model_prefill_lmhead_qwen.cpp
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)

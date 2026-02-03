@@ -290,6 +290,7 @@ struct common_params {
     struct common_params_model model;
 
     std::string model_alias          = ""; // model alias                                                   // NOLINT
+    std::string dvfs_model           = "auto"; // dvfs/energy/roofline model pack id (e.g., "llama3.2-1b", "qwen2.5-1.5b", "auto")
     std::string hf_token             = ""; // HF token                                                      // NOLINT
     std::string prompt               = "";                                                                  // NOLINT
     std::string system_prompt        = "";                                                                  // NOLINT

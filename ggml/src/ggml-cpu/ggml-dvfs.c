@@ -154,12 +154,12 @@ void ggml_dvfs_apply_if_needed(int op_id, const char *name)
         snprintf(buf, sizeof(buf), "%d", want_cpu);
 
         int before = get_cpu_freq();
-        printf("Before: %d kHz\n", before);
+        // printf("Before: %d kHz\n", before);
         uint64_t t0 = now_ns();
         set_cpu_freq(buf);
         uint64_t t1 = now_ns();
         int immediately = get_cpu_freq();
-        printf("Immediately after: %d kHz\n", immediately);
+        // printf("Immediately after: %d kHz\n", immediately);
 
         atomic_store_explicit(&g_applied_khz, want_cpu, memory_order_relaxed);
 

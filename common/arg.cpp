@@ -2531,6 +2531,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIAS"));
     add_opt(common_arg(
+        {"--dvfs-model"}, "NAME",
+        string_format(
+            "select dvfs/energy/roofline model pack (default: %s)",
+            params.dvfs_model.c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.dvfs_model = value;
+        }
+    ).set_env("LLAMA_ARG_DVFS_MODEL")); //model for dvfs parse
+    add_opt(common_arg(
         {"-m", "--model"}, "FNAME",
         ex == LLAMA_EXAMPLE_EXPORT_LORA
             ? std::string("model path from which to load base model")

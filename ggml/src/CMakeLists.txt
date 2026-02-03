@@ -213,8 +213,11 @@ add_library(ggml-base STATIC
             roofline_select.cpp
             roofline_gflops.cpp
             roofline_params_init.cpp
+            roofline_params_init_qwen.cpp
+            roofline_params_init_llama3b.cpp
             ggml-cpu/ggml-mckp-dvfs.cpp
             ggml-cpu/selector.cpp
+            ggml-dvfs-alias.cpp
             )
 
 target_include_directories(ggml-base

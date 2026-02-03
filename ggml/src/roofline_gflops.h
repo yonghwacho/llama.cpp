@@ -27,8 +27,8 @@ struct RooflineGflopsParams {
     // Python과 동일한 latency scaling을 위한 baseline(실측 기반)
     double baseline_lat_us  = 0.0;   // measured @ (cpu0,maxmif) 또는 (maxcpu,mif0) 등
     double baseline_flops   = 0.0;   // measured flops per run (baseline)
-    int    baseline_cpu_ridge = 0;   // cpu_ridge baseline (python: baseline_cpu_ridge)
-    int    baseline_mif_ridge = 0;   // mif_ridge baseline (python: baseline_mif_ridge)
+    int64_t    baseline_cpu_ridge = 0;   // cpu_ridge baseline (python: baseline_cpu_ridge)
+    int64_t    baseline_mif_ridge = 0;   // mif_ridge baseline (python: baseline_mif_ridge)
 };
 
 
