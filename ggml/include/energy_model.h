@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <cstdio>
 #include "perf_frame.h"
 
 // perf_frame.h 에서:

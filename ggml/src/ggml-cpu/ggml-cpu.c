@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
+#include <sys/syscall.h>
 /*DVfS*/
 #include "ggml-dvfs.h" 
 #include "ggml-backend-impl.h"
