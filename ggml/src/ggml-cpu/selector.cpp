@@ -4,7 +4,7 @@
 #include "energy_model.h"
 #include <iostream>
 #include "roofline_params_init.h"
-
+#include <cstring>
 #ifdef __cplusplus
 extern "C" {
 #endif
