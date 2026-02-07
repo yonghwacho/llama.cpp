@@ -93,7 +93,7 @@ extern "C" {
         ctx_params.n_batch = n_prompt;
         ctx_params.no_perf = false;
         ctx_params.n_threads = n_threads;
-        ctx_params.flash_attn_type = enable_flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        ctx_params.flash_attn = enable_flash_attn;
         
         llama_context* ctx = llama_init_from_model(model, ctx_params);
         if (ctx == NULL) {
