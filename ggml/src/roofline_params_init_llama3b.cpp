@@ -57,15 +57,15 @@ void init_llama3b_roofline_params() {
     );
 
     roofline_set_params(
-        ST_DECODE, G_LMHEAD,
+        ST_DECODE, G_OTHER,
         RooflineGflopsParams{
-            /*k_c1_over_c2=*/0.000612599175772006563,
+            /*k_c1_over_c2=*/0.000612560544591173972,
             /*sweep_axis=*/RooflineSweepAxis::CPU_SWEEP,
             /*max_candidates=*/64,
 
             // Python ridge-scaling baseline
-            /*baseline_lat_us=*/25429.497000000003,
-            /*baseline_flops=*/788005000,
+            /*baseline_lat_us=*/9328.78299999999945,
+            /*baseline_flops=*/276886000,
             /*baseline_cpu_ridge=*/1958400,
             /*baseline_mif_ridge=*/3199000000,
         }
